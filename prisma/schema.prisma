@@ -1,0 +1,224 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum StockStatus {
+  in_stock
+  short_term
+  long_term
+  discarded
+}
+
+enum LoanType {
+  short_term
+  long_term
+}
+
+model Product {
+  id                String   @id @default(uuid()) @db.Uuid
+  name              String   @default("")
+  brand             String   @default("")
+  model             String   @default("")
+  specifications    String   @default("")
+  price             Decimal? @db.Decimal(12, 2)
+  imageLink         String?
+  localImage        String?
+  isPropertyManaged Boolean  @default(false)
+  createdAt         DateTime @default(now())
+
+  // relations
+  stocks        Stock[]
+  files         ProductFile[]
+  rentals       Rental[]
+  Discarded     Discarded[]
+  categoryItems ProductCategoryItem[] // 反向關聯
+
+  @@index([name])
+  @@index([brand, model])
+}
+
+model Location {
+  id       String     @id @default(uuid()) @db.Uuid
+  label    String
+  parentId String?    @db.Uuid
+  parent   Location?  @relation("LocationChildren", fields: [parentId], references: [id])
+  children Location[] @relation("LocationChildren")
+
+  // relations
+  stocks        Stock[]
+  rentals       Rental[]
+  transfersFrom Transfer[]  @relation("TransferFrom")
+  transfersTo   Transfer[]  @relation("TransferTo")
+  Discarded     Discarded[]
+
+  @@index([parentId])
+  @@index([label])
+}
+
+model Stock {
+  id            String      @id @default(uuid()) @db.Uuid
+  productId     String      @db.Uuid
+  locationId    String      @db.Uuid
+  product       Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+  location      Location    @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  currentStatus StockStatus @default(in_stock)
+  discarded     Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+
+  // relations
+  rentals   Rental[]
+  transfers Transfer[]
+  iams      IamsMapping?
+  Discarded Discarded?
+
+  @@index([productId])
+  @@index([locationId])
+  @@index([currentStatus])
+}
+
+model Discarded {
+  id              String    @id @default(uuid()) @db.Uuid
+  stockId         String    @unique @db.Uuid
+  productId       String    @db.Uuid
+  locationId      String    @db.Uuid
+  discardReason   String?
+  discardOperator String?
+  discardDate     DateTime?
+
+  stock    Stock    @relation(fields: [stockId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+
+  @@index([productId])
+  @@index([locationId])
+  @@index([discardDate])
+}
+
+model ProductFile {
+  id          String   @id @default(uuid()) @db.Uuid
+  productId   String   @db.Uuid
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  path        String
+  partNumber  String   @map("P/N")
+  description String?
+  files       Json     @default("{}")
+  sizeBytes   Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([productId])
+}
+
+model Device {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  createdAt DateTime @default(now())
+}
+
+// prisma/schema.prisma (only the User model shown)
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  username     String   @unique
+  email        String?  @unique // ← optional, useful for future reset
+  passwordHash String   @default("")
+  createdAt    DateTime @default(now())
+}
+
+model IamsMapping {
+  // 以 stockId 當主鍵，對應到 Stock.id（一對一）
+  stockId String @id @db.Uuid
+  iamsId  String @unique
+  stock   Stock  @relation(fields: [stockId], references: [id], onDelete: Cascade)
+}
+
+model ProductCategory {
+  id    String                @id @default(uuid()) @db.Uuid
+  name  String                @unique
+  items ProductCategoryItem[]
+}
+
+model ProductCategoryItem {
+  categoryId String @db.Uuid
+  productId  String @db.Uuid
+
+  category ProductCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  product  Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@id([categoryId, productId]) // 複合主鍵避免重複
+  @@index([productId])
+}
+
+model Rental {
+  id         String    @id @default(uuid()) @db.Uuid
+  stockId    String    @db.Uuid
+  productId  String    @db.Uuid
+  locationId String    @db.Uuid
+  borrower   String
+  renter     String
+  loanType   LoanType  @default(short_term)
+  loanDate   DateTime
+  dueDate    DateTime?
+  returnDate DateTime?
+
+  stock    Stock    @relation(fields: [stockId], references: [id], onDelete: Restrict)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+
+  @@index([stockId])
+  @@index([productId])
+  @@index([locationId])
+  @@index([loanType])
+}
+
+model Transfer {
+  id           String   @id @default(uuid()) @db.Uuid
+  stockId      String   @db.Uuid
+  fromLocation String   @db.Uuid
+  toLocation   String   @db.Uuid
+  createdAt    DateTime @default(now())
+
+  stock Stock    @relation(fields: [stockId], references: [id], onDelete: Restrict)
+  from  Location @relation("TransferFrom", fields: [fromLocation], references: [id], onDelete: Restrict)
+  to    Location @relation("TransferTo", fields: [toLocation], references: [id], onDelete: Restrict)
+
+  @@index([stockId])
+  @@index([fromLocation])
+  @@index([toLocation])
+}
+
+model VerificationCode {
+id String @id @default(uuid()) @db.Uuid
+email String
+userId String? @db.Uuid
+purpose String // "signup" | "reset"
+codeHash String
+attempts Int @default(0)
+maxAttempts Int @default(5)
+expiresAt DateTime
+consumedAt DateTime?
+payload Json?
+createdAt DateTime @default(now())
+
+
+@@index([email])
+@@index([userId])
+@@index([purpose, expiresAt])
+}
+
+model QAItem {
+  id        String   @id
+  title     String
+  tags      String[] @default([])
+  order     Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  contentMd String   @db.Text
+
+  @@index([order])
+  @@index([updatedAt])
+}

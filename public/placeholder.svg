@@ -1,0 +1,12 @@
+<!--?xml version="1.0" encoding="UTF-8"?-->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!-- Outer rounded rectangle frame -->
+  <rect x="2" y="2" width="60" height="60" rx="8" ry="8" fill="#F3F4F6" stroke="#CBD5E1" stroke-width="2"></rect>
+  
+  <!-- Simple photo placeholder: mountain and sun -->
+  <path d="M14 46 L26 30 L36 42 L44 34 L54 46 Z" fill="#E5E7EB" stroke="#D1D5DB" stroke-width="2"></path>
+  <circle cx="44" cy="20" r="5" fill="none" stroke="#D1D5DB" stroke-width="2"></circle>
+  
+  <!-- Subtle 'placeholder' cue using dashed border inside (no text, no slash) -->
+  <rect x="8" y="8" width="48" height="48" rx="6" ry="6" fill="none" stroke="#E5E7EB" stroke-width="1.5" stroke-dasharray="4 3"></rect>
+</svg>

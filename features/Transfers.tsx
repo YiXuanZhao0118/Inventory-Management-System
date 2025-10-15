@@ -1,15 +1,7 @@
-//features\Transfers.tsx
+// features/Transfers.tsx
 "use client";
-
-import React, { useMemo, useState } from "react";
-import useSWR from "swr";
-import { Archive, Package } from "lucide-react";
-import { useLanguage } from "@/components/LanguageSwitcher";
-import zhTW from "@/app/data/language/zh-TW.json";
-import enUS from "@/app/data/language/en-US.json";
-import hiIN from "@/app/data/language/hi.json";
-import deDE from "@/app/data/language/de.json";
-import { fetcher } from "@/services/apiClient";
+import React, { useMemo, useState, useEffect, useCallback } from "react";
+import { ArrowLeftRight, Archive, Package } from "lucide-react";
 import {
   DndContext,
   useSensor,
@@ -18,60 +10,102 @@ import {
   useDraggable,
   useDroppable,
 } from "@dnd-kit/core";
-import { LocationField } from "@/components/LocationField";
+import { useJson } from "@/hooks/useJson";
+import { useLanguage } from "@/src/components/LanguageSwitcher";
 
-type IAMSMap = { stockid: string; IAMSID: string };
+import zhTW from "@/app/data/language/zh-TW.json";
+import enUS from "@/app/data/language/en-US.json";
+import hiIN from "@/app/data/language/hi.json";
+import deDE from "@/app/data/language/de.json";
 
-// 小工具：抽取數字
-const digits = (s?: string) => (s ? s.replace(/\D+/g, "") : "");
+/* =================== Utils =================== */
+const qs = (o: Record<string, any>) =>
+  "?" +
+  Object.entries(o)
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    .map(
+      ([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`
+    )
+    .join("&");
 
-type PMItem = {
-  stockId: string;
-  product: { id: string; name: string; model: string; brand: string };
-  locationId: string;
-  locationPath: string[];
+const debounce = <F extends (...a: any[]) => void>(fn: F, ms = 250) => {
+  let t: any;
+  return (...args: Parameters<F>) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
 };
 
-type NonPMGroup = {
-  productId: string;
-  product: { id: string; name: string; model: string; brand: string };
+const format = (tpl: string, vars: Record<string, string | number>) =>
+  tpl.replace(/\{(\w+)\}/g, (_, k) => String(vars[k] ?? ""));
+
+/* =================== Types =================== */
+type ProductLite = { id: string; name: string; model: string; brand: string };
+type PMApiItem = {
+  stockId: string;
+  product: ProductLite;
+  locationId: string;
+  locationPath: string[];
+  currentStatus: "in_stock" | "short_term" | "long_term" | "discarded";
+  iamsId?: string | null;
+};
+type NonApiItem = {
+  product: ProductLite;
   locationId: string;
   locationPath: string[];
   quantity: number;
+  currentStatus: "in_stock" | "short_term" | "long_term" | "discarded";
+};
+type PagedResp<T> = {
+  items: T[];
+  total?: number;
+  page?: number;
+  pageSize?: number;
 };
 
 type LocationNode = { id: string; label: string; children?: LocationNode[] };
 
 type GetResp = {
-  propertyManaged: PMItem[];
-  nonPropertyManaged: NonPMGroup[];
+  propertyManaged: Array<{
+    stockId: string;
+    product: ProductLite;
+    locationId: string;
+    locationPath: string[];
+    iamsId?: string | null;
+  }>;
+  nonPropertyManaged: Array<{
+    productId: string;
+    product: ProductLite;
+    locationId: string;
+    locationPath: string[];
+    quantity: number;
+  }>;
   locations: LocationNode[];
 };
 
-// 轉移籃中的項目
+// Cart
 type CartPM = {
   type: "pm";
   stockId: string;
-  product: PMItem["product"];
+  product: ProductLite;
   fromLocation: string;
   fromPath: string[];
   toLocation: string | "";
+  iamsId?: string | null;
 };
-
 type CartNonPM = {
   type: "non";
   productId: string;
-  product: NonPMGroup["product"];
+  product: ProductLite;
   fromLocation: string;
   fromPath: string[];
   toLocation: string | "";
-  quantity: number; // 要移動的數量
-  maxQuantity: number; // 可移動上限（來源地可用數量）
+  quantity: number;
+  maxQuantity: number;
 };
-
 type CartItem = CartPM | CartNonPM;
 
-/** 把地點樹攤平成下拉清單可用的 {id, pathLabel} */
+/* =================== Small UI =================== */
 function flattenLocations(roots: LocationNode[]) {
   const list: { id: string; path: string[]; label: string; isLeaf: boolean }[] =
     [];
@@ -85,7 +119,6 @@ function flattenLocations(roots: LocationNode[]) {
   return list;
 }
 
-/** 可拖曳卡片 + 右側加入按鈕；拖拉把手獨立在左邊避免誤觸 */
 function DraggableCard({
   id,
   children,
@@ -111,21 +144,17 @@ function DraggableCard({
       ref={setNodeRef}
       className="rounded-lg border bg-white dark:bg-gray-800 dark:border-gray-700 p-3 shadow-sm flex items-start justify-between gap-3"
     >
-      {/* drag handle */}
       <div
         className="shrink-0 mt-0.5 px-1 text-gray-400 cursor-grab active:cursor-grabbing select-none"
-        aria-label="拖拉"
+        aria-label="drag"
         {...listeners}
         {...attributes}
       >
         ⠿
       </div>
-
       <div className="flex-1 min-w-0">{children}</div>
-
       <button
         className="shrink-0 px-2 py-1 text-xs rounded bg-indigo-600 hover:bg-indigo-700 text-white"
-        // 防止按鈕點擊被當成拖拉起手
         onPointerDownCapture={(e) => e.stopPropagation()}
         onClick={(e) => {
           e.stopPropagation();
@@ -138,19 +167,12 @@ function DraggableCard({
   );
 }
 
-/** 轉移區（放置區） */
-function DropZone({
-  onDropId,
-  children,
-}: {
-  onDropId: (dragId: string) => void;
-  children: React.ReactNode;
-}) {
+function DropZone({ children }: { children: React.ReactNode }) {
   const { setNodeRef, isOver } = useDroppable({ id: "dropzone" });
   return (
     <div
       ref={setNodeRef}
-      className={`rounded-xl border-2 p-4 min-h-[140px] transition-colors ${
+      className={`min-h-[160px] p-4 rounded-lg border-2 border-dashed dark:border-gray-700 bg-white dark:bg-gray-800 ${
         isOver
           ? "border-indigo-500 bg-indigo-50 dark:bg-indigo-950/30"
           : "border-dashed border-gray-300 dark:border-gray-700"
@@ -161,6 +183,243 @@ function DropZone({
   );
 }
 
+function TreeLocationSelect({
+  value,
+  onChange,
+  roots,
+  placeholder,
+  disabled,
+  widthClass = "w-72",
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  roots: LocationNode[]; // ← 用 locations 樹
+  placeholder: string;
+  disabled?: boolean;
+  widthClass?: string;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [query, setQuery] = React.useState("");
+  const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set());
+  const rootRef = React.useRef<HTMLDivElement>(null); // ← 新增
+
+  // 建 parent/children map & 找到 label 與是否 leaf
+  const { byId, parentOf, isLeaf, fullLabel } = React.useMemo(() => {
+    const byId = new Map<string, LocationNode>();
+    const parentOf = new Map<string, string | null>();
+    const isLeaf = new Map<string, boolean>();
+
+    const walk = (n: LocationNode, parent: string | null) => {
+      byId.set(n.id, n);
+      parentOf.set(n.id, parent);
+      const leaf = !n.children || n.children.length === 0;
+      isLeaf.set(n.id, leaf);
+      n.children?.forEach((c) => walk(c, n.id));
+    };
+    roots.forEach((r) => walk(r, null));
+
+    const fullLabel = (id: string) => {
+      if (!id || !byId.has(id)) return "";
+      const path: string[] = [];
+      let cur: string | null = id;
+      while (cur) {
+        const node = byId.get(cur)!;
+        path.push(node.label);
+        cur = parentOf.get(cur) ?? null;
+      }
+      return path.reverse().join(" → ");
+    };
+
+    return { byId, parentOf, isLeaf, fullLabel };
+  }, [roots]);
+
+  // 預設展開目前選取節點的祖先
+  React.useEffect(() => {
+    if (!value) return;
+    const set = new Set<string>();
+    let cur: string | null = value;
+    while (cur) {
+      set.add(cur);
+      cur = (parentOf.get(cur) as string | null) ?? null;
+    }
+    setExpanded(set);
+  }, [value, parentOf]);
+
+  // 搜尋：顯示符合的節點與其祖先
+  const q = query.trim().toLowerCase();
+  const matches = React.useMemo(() => {
+    if (!q) return new Set<string>();
+    const hit = new Set<string>();
+    for (const [id, n] of byId.entries()) {
+      if (n.label.toLowerCase().includes(q)) {
+        // 命中自己與祖先
+        let cur: string | null = id;
+        while (cur) {
+          hit.add(cur);
+          cur = (parentOf.get(cur) as string | null) ?? null;
+        }
+      }
+    }
+    return hit;
+  }, [q, byId, parentOf]);
+
+  // 可見列（依展開狀態/搜尋自動展開）
+  const visible = React.useMemo(() => {
+    const rows: Array<{ id: string; depth: number }> = [];
+    const walk = (n: LocationNode, depth: number) => {
+      rows.push({ id: n.id, depth });
+      const openThis = q ? matches.has(n.id) : expanded.has(n.id); // 搜尋時自動展開命中路徑
+      if (openThis && n.children) {
+        n.children.forEach((c) => walk(c, depth + 1));
+      }
+    };
+    roots.forEach((r) => walk(r, 0));
+    return rows;
+  }, [roots, expanded, q, matches]);
+
+  const toggle = (id: string) => {
+    const node = byId.get(id);
+    if (!node?.children || node.children.length === 0) return; // 葉不收展
+    const next = new Set(expanded);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setExpanded(next);
+  };
+
+  // 🔒 點擊/聚焦到元件外就關閉（捕獲階段，避免被 DnD 攔截）
+  React.useEffect(() => {
+    const closeIfOutside = (ev: Event) => {
+      const root = rootRef.current;
+      const t = ev.target as Node | null;
+      if (!root || !t) return;
+      if (!root.contains(t)) {
+        setOpen(false);
+        setQuery("");
+      }
+    };
+    document.addEventListener("pointerdown", closeIfOutside, true);
+    document.addEventListener("focusin", closeIfOutside, true);
+    const onResize = () => setOpen(false);
+    window.addEventListener("resize", onResize);
+
+    return () => {
+      document.removeEventListener("pointerdown", closeIfOutside, true);
+      document.removeEventListener("focusin", closeIfOutside, true);
+      window.removeEventListener("resize", onResize);
+    };
+  }, []);
+
+  return (
+    <div
+      ref={rootRef}
+      className={`relative ${widthClass}`}
+      data-locselect-root
+      aria-expanded={open}
+    >
+      <div className="flex gap-2 items-center">
+        <input
+          disabled={disabled}
+          className="flex-1 min-w-0 w-full px-2 py-1 border rounded dark:bg-gray-800 dark:border-gray-700 text-[14px] leading-tight"
+          placeholder={placeholder}
+          value={open ? query : fullLabel(value)}
+          onFocus={() => setOpen(true)}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              setOpen(false);
+              setQuery("");
+            }
+          }}
+        />
+        {value && (
+          <button
+            type="button"
+            className="px-2 border rounded dark:border-gray-700"
+            onClick={() => onChange("")}
+            title="清除"
+          >
+            ✕
+          </button>
+        )}
+      </div>
+
+      {open && (
+        <ul
+          className="absolute z-40 mt-1 max-h-72 w-full overflow-auto rounded-md border bg-white shadow-lg dark:bg-gray-900 dark:border-gray-700"
+          role="listbox"
+        >
+          {visible.length === 0 ? (
+            <li className="px-3 py-2 text-sm text-gray-500">沒有符合的位置</li>
+          ) : (
+            visible.map(({ id, depth }) => {
+              const node = byId.get(id)!;
+              const leaf = isLeaf.get(id)!;
+              const active = value === id;
+              const isOpen =
+                (node.children?.length ?? 0) > 0 &&
+                (q ? matches.has(id) : expanded.has(id));
+
+              return (
+                <li
+                  key={id}
+                  className={`px-3 py-1.5 text-sm flex items-center gap-2 ${
+                    active ? "bg-indigo-50 dark:bg-indigo-950/30" : ""
+                  }`}
+                  style={{ paddingLeft: 12 + depth * 14 }}
+                  role="option"
+                  aria-selected={active}
+                  title={node.label}
+                >
+                  {/* 展開箭頭（僅非葉） */}
+                  {node.children && node.children.length > 0 ? (
+                    <button
+                      type="button"
+                      className="shrink-0 w-4 text-gray-500"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggle(id);
+                      }}
+                      aria-label={isOpen ? "collapse" : "expand"}
+                    >
+                      {isOpen ? "▾" : "▸"}
+                    </button>
+                  ) : (
+                    <span className="shrink-0 w-4" />
+                  )}
+
+                  {/* 標籤（葉可選；夾點則切換展開） */}
+                  <button
+                    type="button"
+                    className={`flex-1 text-left ${
+                      leaf
+                        ? "hover:underline"
+                        : "text-gray-700 dark:text-gray-300"
+                    }`}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      if (leaf) {
+                        onChange(id);
+                        setOpen(false);
+                        setQuery("");
+                      } else {
+                        toggle(id);
+                      }
+                    }}
+                  >
+                    {node.label}
+                  </button>
+                </li>
+              );
+            })
+          )}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/* =================== Main =================== */
 export default function TransfersModal({
   isOpen,
   onClose,
@@ -168,45 +427,116 @@ export default function TransfersModal({
   isOpen: boolean;
   onClose: () => void;
 }) {
-  const { data: iamsData } = useSWR<IAMSMap[]>("/api/iams", fetcher);
+  const PAGE_SIZE = 20;
+  const status = "in_stock";
 
-  const iamsByStock = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const r of iamsData ?? []) {
-      if (r?.stockid && r?.IAMSID) m.set(r.stockid, r.IAMSID);
-    }
-    return m;
-  }, [iamsData]);
+  const { language } = useLanguage();
+  const tMap: Record<string, any> = {
+    "zh-TW": zhTW,
+    "en-US": enUS,
+    "hi-IN": hiIN,
+    de: deDE,
+  };
+  const t = (tMap[language] || zhTW).TransfersModal;
 
-  const { data, error, mutate } = useSWR<GetResp>("/api/transfers", fetcher, {
-    revalidateOnFocus: true,
-  });
   const [cart, setCart] = useState<CartItem[]>([]);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [posting, setPosting] = useState(false);
+
+  // searches (debounced)
+  const [searchPMRaw, setSearchPMRaw] = useState("");
+  const [searchNonRaw, setSearchNonRaw] = useState("");
   const [searchPM, setSearchPM] = useState("");
   const [searchNon, setSearchNon] = useState("");
 
-  // 全部項目共同目標地點
+  useEffect(() => {
+    const d1 = debounce(setSearchPM, 250);
+    d1(searchPMRaw);
+    return () => d1("");
+  }, [searchPMRaw]);
+
+  useEffect(() => {
+    const d2 = debounce(setSearchNon, 250);
+    d2(searchNonRaw);
+    return () => d2("");
+  }, [searchNonRaw]);
+
   const [globalTo, setGlobalTo] = useState<string>("");
-  function applyGlobalTo(all = false) {
-    if (!globalTo) return;
-    setCart((prev) =>
-      prev.map((item) => {
-        if (all) {
-          return { ...item, toLocation: globalTo } as CartItem;
-        }
-        if (!item.toLocation) {
-          return { ...item, toLocation: globalTo } as CartItem;
-        }
-        return item;
-      })
-    );
-  }
+
+  // paging
+  const [pmPage, setPmPage] = useState(1);
+  const [nonPage, setNonPage] = useState(1);
+
+  useEffect(() => setPmPage(1), [searchPM]);
+  useEffect(() => setNonPage(1), [searchNon]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } })
   );
+
+  // fetch lists (server paging)
+  const pmKey = useMemo(
+    () =>
+      `/api/inventory/pm${qs({
+        status,
+        q: searchPM.trim(),
+        page: pmPage,
+        limit: PAGE_SIZE,
+      })}`,
+    [status, searchPM, pmPage]
+  );
+  const nonKey = useMemo(
+    () =>
+      `/api/inventory/nonpm${qs({
+        status,
+        q: searchNon.trim(),
+        page: nonPage,
+        limit: PAGE_SIZE,
+      })}`,
+    [status, searchNon, nonPage]
+  );
+
+  const {
+    data: pmRes,
+    error: pmErr,
+    refetch: refetchPm,
+  } = useJson<PagedResp<PMApiItem>>(pmKey);
+  const {
+    data: nonRes,
+    error: nonErr,
+    refetch: refetchNon,
+  } = useJson<PagedResp<NonApiItem>>(nonKey);
+  const { data: locRes, error: locErr } = useJson<{ tree: LocationNode[] }>(
+    "/api/locations/tree"
+  );
+
+  const iamsByStock = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const s of pmRes?.items ?? [])
+      if (s.iamsId) m.set(s.stockId, s.iamsId);
+    return m;
+  }, [pmRes?.items]);
+
+  const data: GetResp | undefined = useMemo(() => {
+    if (!pmRes || !nonRes || !locRes) return undefined;
+    return {
+      propertyManaged: (pmRes.items ?? []).map((s) => ({
+        stockId: s.stockId,
+        product: s.product,
+        locationId: s.locationId,
+        locationPath: s.locationPath,
+        iamsId: s.iamsId ?? null,
+      })),
+      nonPropertyManaged: (nonRes.items ?? []).map((g) => ({
+        productId: g.product.id,
+        product: g.product,
+        locationId: g.locationId,
+        locationPath: g.locationPath,
+        quantity: g.quantity,
+      })),
+      locations: locRes.tree ?? [],
+    };
+  }, [pmRes, nonRes, locRes]);
 
   const flatLoc = useMemo(
     () => flattenLocations(data?.locations ?? []),
@@ -215,68 +545,21 @@ export default function TransfersModal({
   const locLabel = (id: string) =>
     flatLoc.find((l) => l.id === id)?.label ?? "";
 
-  // 來源清單（搜尋）
-  const pmList = useMemo(() => {
-    const list = data?.propertyManaged ?? [];
-    const q = searchPM.trim().toLowerCase();
-    if (!q) return list;
+  const pmList = useMemo(
+    () => data?.propertyManaged ?? [],
+    [data?.propertyManaged]
+  );
+  const nonList = useMemo(
+    () => data?.nonPropertyManaged ?? [],
+    [data?.nonPropertyManaged]
+  );
 
-    const qDigits = digits(q);
-
-    return list.filter((i) => {
-      // 原本的文字比對（名稱/型號/品牌/路徑/stockId）
-      const text = [
-        i.stockId,
-        i.product?.name,
-        i.product?.model,
-        i.product?.brand,
-        i.locationPath?.join(" "),
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      const textHit = text.includes(q);
-
-      // IAMS 比對（對照 stockId → IAMSID）
-      const iamssid = iamsByStock.get(i.stockId) || "";
-      const iamssidLower = iamssid.toLowerCase();
-      const iamsHit =
-        (iamssidLower && iamssidLower.includes(q)) ||
-        (!!qDigits && digits(iamssid).includes(qDigits));
-
-      // 也順手做「純數字」比 stockId 的數字，以防你有把 stockId 做成含數字的 QR 格式
-      const idDigitsHit = !!qDigits && digits(i.stockId).includes(qDigits);
-
-      return textHit || iamsHit || idDigitsHit;
-    });
-  }, [data?.propertyManaged, searchPM, iamsByStock]);
-
-  const nonList = useMemo(() => {
-    const list = data?.nonPropertyManaged ?? [];
-    if (!searchNon.trim()) return list;
-    const q = searchNon.trim().toLowerCase();
-    return list.filter((i) =>
-      [
-        i.productId,
-        i.product.name,
-        i.product.model,
-        i.product.brand,
-        i.locationPath.join(" "),
-      ]
-        .join(" ")
-        .toLowerCase()
-        .includes(q)
-    );
-  }, [data?.nonPropertyManaged, searchNon]);
-
-  // === 新增：PM 已加入集合（避免重複顯示） ===
   const cartPMSet = useMemo(() => {
     const s = new Set<string>();
     for (const c of cart) if (c.type === "pm") s.add((c as CartPM).stockId);
     return s;
   }, [cart]);
 
-  // === 新增：Non-PM 已加入數量對照表 key=productId::fromLocation ===
   const cartNonUsedMap = useMemo(() => {
     const m = new Map<string, number>();
     for (const c of cart) {
@@ -288,31 +571,31 @@ export default function TransfersModal({
     return m;
   }, [cart]);
 
-  // === 新增：PM 顯示清單（移除已加入的） ===
-  const pmListDisplay = useMemo(() => {
-    return pmList.filter((item) => !cartPMSet.has(item.stockId));
-  }, [pmList, cartPMSet]);
+  const pmListDisplay = useMemo(
+    () => pmList.filter((i) => !cartPMSet.has(i.stockId)),
+    [pmList, cartPMSet]
+  );
 
-  // === 新增：Non 顯示清單（顯示剩餘數量，0 就不顯示） ===
   const nonListDisplay = useMemo(() => {
     return nonList
-      .map((item) => {
-        const key = `${item.productId}::${item.locationId}`;
+      .map((g) => {
+        const key = `${g.productId}::${g.locationId}`;
         const used = cartNonUsedMap.get(key) ?? 0;
-        const remaining = Math.max(0, item.quantity - used);
-        return { ...item, remaining };
+        const remaining = Math.max(0, g.quantity - used);
+        return { ...g, remaining };
       })
-      .filter((item) => item.remaining > 0);
+      .filter((g) => g.remaining > 0);
   }, [nonList, cartNonUsedMap]);
 
-  /** 封裝：加入 PM 一筆（避免重複） */
+  const pmHasNext = (pmRes?.items?.length ?? 0) === PAGE_SIZE;
+  const nonHasNext = (nonRes?.items?.length ?? 0) === PAGE_SIZE;
+
+  // actions
   const addPmByStockId = (stockId: string) => {
-    const src = (data?.propertyManaged ?? []).find(
-      (i) => i.stockId === stockId
-    );
+    const src = pmList.find((i) => i.stockId === stockId);
     if (!src) return;
     setCart((prev) =>
-      prev.some((x) => x.type === "pm" && x.stockId === stockId)
+      prev.some((x) => x.type === "pm" && (x as CartPM).stockId === stockId)
         ? prev
         : [
             ...prev,
@@ -323,14 +606,14 @@ export default function TransfersModal({
               fromLocation: src.locationId,
               fromPath: src.locationPath,
               toLocation: "",
-            },
+              iamsId: src.iamsId ?? null,
+            } as CartPM,
           ]
     );
   };
 
-  /** 封裝：加入 Non-PM（同產品同來源累加，且不超過 cap） */
   const addNonByKey = (productId: string, fromLocation: string) => {
-    const src = (data?.nonPropertyManaged ?? []).find(
+    const src = nonList.find(
       (i) => i.productId === productId && i.locationId === fromLocation
     );
     if (!src) return;
@@ -344,11 +627,12 @@ export default function TransfersModal({
       if (idx >= 0) {
         const cur = prev[idx] as CartNonPM;
         if (cur.quantity >= cur.maxQuantity) return prev;
+        const cap = src.quantity;
         const next = [...prev];
         next[idx] = {
           ...cur,
-          quantity: Math.min(cur.quantity + 1, src.quantity),
-          maxQuantity: src.quantity,
+          quantity: Math.min(cur.quantity + 1, cap),
+          maxQuantity: cap,
         };
         return next;
       } else {
@@ -369,8 +653,7 @@ export default function TransfersModal({
     });
   };
 
-  // 拖曳結束 => 呼叫上面的 add helpers
-  function handleDragEnd(event: any) {
+  const handleDragEnd = (event: any) => {
     const { over, active } = event;
     if (!over || over.id !== "dropzone") return;
     const dragId: string = active.id;
@@ -380,97 +663,93 @@ export default function TransfersModal({
       const [, productId, fromLocation] = dragId.split("::");
       addNonByKey(productId, fromLocation);
     }
-  }
+  };
 
-  // 檢查有效性（原樣）
+  const applyGlobalTo = useCallback(
+    (all = false) => {
+      if (!globalTo) return;
+      setCart((prev) =>
+        prev.map((item) => {
+          if (all) return { ...item, toLocation: globalTo } as CartItem;
+          if (!item.toLocation)
+            return { ...item, toLocation: globalTo } as CartItem;
+          return item;
+        })
+      );
+    },
+    [globalTo]
+  );
+
   const validateCart = () => {
-    if (cart.length === 0) return "請先加入要轉移的項目";
-
+    if (cart.length === 0) return t.errAddItemsFirst as string;
     for (const c of cart) {
-      if (!c.toLocation) return "請為每筆選擇目標地點";
-      if (c.toLocation === c.fromLocation) return "目標地點不可與來源相同";
-
+      if (!c.toLocation) return t.errChooseTarget as string;
+      if (c.toLocation === c.fromLocation) return t.errTargetSame as string;
       const leaf = flatLoc.find((l) => l.id === c.toLocation)?.isLeaf;
-      if (!leaf) return "目標地點只能選擇結構最底層的節點";
-
-      if (c.type === "non" && c.quantity < 1) return "數量不可小於 1";
-    }
-
-    const sumMap = new Map<string, { used: number; cap: number }>();
-    for (const group of data?.nonPropertyManaged ?? []) {
-      sumMap.set(`${group.productId}::${group.locationId}`, {
-        used: 0,
-        cap: group.quantity,
-      });
-    }
-    for (const c of cart) {
+      if (!leaf) return t.errLeafOnly as string;
       if (c.type === "non") {
-        const key = `${c.productId}::${c.fromLocation}`;
-        const rec = sumMap.get(key);
-        if (!rec)
-          return `來源不足（${c.product.name} @ ${locLabel(c.fromLocation)}）`;
-        rec.used += c.quantity;
-        if (rec.used > rec.cap)
-          return `來源數量不足：${c.product.name}（要求 ${rec.used} > 可用 ${rec.cap}）`;
+        const n = c as CartNonPM;
+        if (n.quantity < 1) return t.errQtyTooSmall as string;
+        if (n.quantity > n.maxQuantity) {
+          return format(t.errInsufficient, {
+            name: c.product.name,
+            req: n.quantity,
+            avail: n.maxQuantity,
+          });
+        }
       }
     }
     return "";
   };
 
-  // 產生送出的 payload（原樣）
-  const buildPayload = () => {
-    return cart.map((c) =>
-      c.type === "pm"
-        ? {
-            stockId: c.stockId,
-            fromLocation: c.fromLocation,
-            toLocation: c.toLocation,
-          }
-        : {
-            productId: c.productId,
-            quantity: c.quantity,
-            fromLocation: c.fromLocation,
-            toLocation: c.toLocation,
-          }
-    );
+  const buildPayloadV2 = () => {
+    const pmRows = cart
+      .filter((c) => c.type === "pm")
+      .map((c) => ({
+        stockId: (c as CartPM).stockId,
+        fromLocation: c.fromLocation,
+        toLocation: c.toLocation,
+      }));
+    const nonRows = cart
+      .filter((c) => c.type === "non")
+      .map((c) => ({
+        ProductId: (c as CartNonPM).productId,
+        LocationId: c.fromLocation,
+        quantity: (c as CartNonPM).quantity,
+        toLocation: c.toLocation,
+      }));
+    return { PropertyManaged: pmRows, nonPropertyManaged: nonRows };
   };
 
   const onConfirmExecute = async () => {
     const err = validateCart();
-    if (err) {
-      alert(err);
-      return;
-    }
+    if (err) return alert(err);
     setPosting(true);
     try {
-      const res = await fetch("/api/transfers", {
+      const res = await fetch("/api/inventory/transfer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildPayload()),
+        body: JSON.stringify(buildPayloadV2()),
       });
       const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
-      await mutate();
+      if (!res.ok || json?.ok === false)
+        throw new Error(json?.message || `HTTP ${res.status}`);
+      await Promise.all([refetchPm(), refetchNon()]);
       setCart([]);
       setConfirmOpen(false);
-      alert("轉移成功");
+      alert(t.transferSuccess);
     } catch (e: any) {
-      alert(`轉移失敗：${e.message || e}`);
+      alert(format(t.transferFailed, { msg: e?.message || String(e) }));
     } finally {
       setPosting(false);
     }
   };
 
-  const { language } = useLanguage();
-  const tMap: Record<string, any> = {
-    "zh-TW": zhTW,
-    "en-US": enUS,
-    "hi-IN": hiIN,
-    de: deDE,
-  };
-  const t = (tMap[language] || zhTW).TransfersModal;
-
   if (!isOpen) return null;
+
+  // page label (localized)
+  const pageLabel = (page: number) =>
+    format(t.pageLabel, { page, size: PAGE_SIZE });
 
   return (
     <div
@@ -482,28 +761,35 @@ export default function TransfersModal({
     >
       <div className="w-full max-w-7xl h-[calc(100vh-2rem)] bg-white dark:bg-gray-900 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
         <div className="flex items-center justify-between px-6 py-3 border-b dark:border-gray-700">
-          <h2 className="text-xl font-semibold">📦 {t.title}</h2>
+          <h2 className="text-xl font-semibold text-gray-900 dark:text-white inline-flex items-center gap-2">
+            <ArrowLeftRight className="w-6 h-6" aria-hidden="true" />
+            {t.title}
+          </h2>
           <button onClick={onClose} className="text-red-500 hover:underline">
             {t.cancelButton}
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto">
-          {error && (
-            <div className="p-6 text-red-600">
-              {t.loadFailed}: {(error as Error).message}
+
+        <div className="p-6 space-y-6 flex-1 overflow-y-auto">
+          {(pmErr || nonErr || locErr) && (
+            <div className="px-4 py-2 rounded bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">
+              {t.loadFailed}
+              {pmErr ? ` (PM: ${pmErr})` : ""}
+              {nonErr ? ` (NonPM: ${nonErr})` : ""}
+              {locErr ? ` (Loc: ${locErr})` : ""}
             </div>
           )}
 
-          {!data && !error && (
+          {!data && !(pmErr || nonErr || locErr) && (
             <div className="p-6 text-gray-600">{t.loading}</div>
           )}
 
           {data && (
             <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
-              {/* 來源清單 */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 p-6">
-                {/* 財產管理（逐一） */}
-                <div>
+              {/* Sources */}
+              <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* PM */}
+                <div className="p-4 rounded-xl border dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
                   <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2">
                       <Archive className="w-4 h-4 text-indigo-600" />
@@ -514,11 +800,11 @@ export default function TransfersModal({
                     <input
                       className="px-2 py-1 border rounded dark:bg-gray-800 dark:border-gray-700"
                       placeholder={t.searchPlaceholder}
-                      value={searchPM}
-                      onChange={(e) => setSearchPM(e.target.value)}
+                      value={searchPMRaw}
+                      onChange={(e) => setSearchPMRaw(e.target.value)}
                     />
                   </div>
-                  <div className="grid gap-3 max-h-80 overflow-auto p-1 border rounded dark:border-gray-700">
+                  <div className="grid gap-3 max-h-[420px] overflow-auto pr-1">
                     {pmListDisplay.map((item) => (
                       <DraggableCard
                         key={item.stockId}
@@ -530,9 +816,8 @@ export default function TransfersModal({
                         </div>
                         <div className="text-sm text-gray-600 dark:text-gray-300">
                           <span className="text-red-600 dark:text-red-200">
-                            {" "}
-                            {item.product.model}{" "}
-                          </span>
+                            {item.product.model}
+                          </span>{" "}
                           ・{item.product.brand}
                         </div>
                         <div className="text-xs">
@@ -541,17 +826,14 @@ export default function TransfersModal({
                             {item.stockId}
                           </span>
                         </div>
-
-                        {/* 👇 新增這段：顯示 IAMSID（有才顯示） */}
-                        {iamsByStock.get(item.stockId) && (
+                        {item.iamsId ? (
                           <div className="text-xs">
                             IAMS:{" "}
                             <span className="font-mono text-purple-600 dark:text-purple-300">
-                              {iamsByStock.get(item.stockId)}
+                              {item.iamsId}
                             </span>
                           </div>
-                        )}
-
+                        ) : null}
                         <div className="text-xs text-gray-500 dark:text-gray-400">
                           {item.locationPath.join(" → ")}
                         </div>
@@ -563,10 +845,41 @@ export default function TransfersModal({
                       </div>
                     )}
                   </div>
+
+                  {/* PM pagination */}
+                  <div className="mt-2 flex items-center justify-between text-xs text-gray-600 dark:text-gray-300">
+                    <span>{pageLabel(pmPage)}</span>
+                    <div className="inline-flex items-center gap-1">
+                      <button
+                        className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                        onClick={() => setPmPage(1)}
+                        disabled={pmPage <= 1}
+                        title={t.firstPage}
+                      >
+                        «
+                      </button>
+                      <button
+                        className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                        onClick={() => setPmPage((p) => Math.max(1, p - 1))}
+                        disabled={pmPage <= 1}
+                        title={t.prevPage}
+                      >
+                        ‹
+                      </button>
+                      <button
+                        className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                        onClick={() => setPmPage((p) => p + 1)}
+                        disabled={!pmHasNext}
+                        title={t.nextPage}
+                      >
+                        ›
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
-                {/* 非財產（聚合） */}
-                <div>
+                {/* Non-PM */}
+                <div className="p-4 rounded-xl border dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
                   <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2">
                       <Package className="w-4 h-4 text-indigo-600" />
@@ -577,11 +890,11 @@ export default function TransfersModal({
                     <input
                       className="px-2 py-1 border rounded dark:bg-gray-800 dark:border-gray-700"
                       placeholder={t.searchPlaceholder}
-                      value={searchNon}
-                      onChange={(e) => setSearchNon(e.target.value)}
+                      value={searchNonRaw}
+                      onChange={(e) => setSearchNonRaw(e.target.value)}
                     />
                   </div>
-                  <div className="grid gap-3 max-h-80 overflow-auto p-1 border rounded dark:border-gray-700">
+                  <div className="grid gap-3 max-h-[420px] overflow-auto pr-1">
                     {nonListDisplay.map((item) => (
                       <DraggableCard
                         key={`${item.productId}::${item.locationId}`}
@@ -595,9 +908,8 @@ export default function TransfersModal({
                         </div>
                         <div className="text-sm text-gray-600 dark:text-gray-300">
                           <span className="text-red-600 dark:text-red-200">
-                            {" "}
-                            {item.product.model}{" "}
-                          </span>
+                            {item.product.model}
+                          </span>{" "}
                           ・{item.product.brand}
                         </div>
                         <div className="text-sm text-gray-600 dark:text-gray-300">
@@ -617,22 +929,56 @@ export default function TransfersModal({
                       </div>
                     )}
                   </div>
+
+                  {/* Non-PM pagination */}
+                  <div className="mt-2 flex items-center justify-between text-xs text-gray-600 dark:text-gray-300">
+                    <span>{pageLabel(nonPage)}</span>
+                    <div className="inline-flex items-center gap-1">
+                      <button
+                        className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                        onClick={() => setNonPage(1)}
+                        disabled={nonPage <= 1}
+                        title={t.firstPage}
+                      >
+                        «
+                      </button>
+                      <button
+                        className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                        onClick={() => setNonPage((p) => Math.max(1, p - 1))}
+                        disabled={nonPage <= 1}
+                        title={t.prevPage}
+                      >
+                        ‹
+                      </button>
+                      <button
+                        className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                        onClick={() => setNonPage((p) => p + 1)}
+                        disabled={!nonHasNext}
+                        title={t.nextPage}
+                      >
+                        ›
+                      </button>
+                    </div>
+                  </div>
                 </div>
-              </div>
+              </section>
 
-              {/* 轉移區 */}
-              <div className="px-6 pb-6">
-                <h3 className="text-lg font-semibold mb-2">{t.transferZone}</h3>
+              {/* Basket */}
+              <section className="p-4 rounded-xl border dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
+                <h3 className="font-semibold text-lg">🧺 {t.transferZone}</h3>
 
-                {/* 全部項目共同目標地點 */}
+                {/* global target */}
                 <div className="mb-3 flex flex-wrap items-center gap-3">
                   <span className="text-sm">{t.globalTarget}</span>
-                  <LocationField
-                    value={globalTo}
-                    onChange={setGlobalTo}
-                    onlyLeaf
-                    getLabelById={locLabel}
-                  />
+                  <div className="flex-1 min-w-0">
+                    <TreeLocationSelect
+                      value={globalTo}
+                      onChange={setGlobalTo}
+                      roots={data?.locations ?? []}
+                      placeholder={t.searchLocationPlaceholder}
+                      widthClass="w-full"
+                    />
+                  </div>
                   <button
                     className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-sm"
                     disabled={!globalTo || cart.length === 0}
@@ -651,7 +997,7 @@ export default function TransfersModal({
                   </button>
                 </div>
 
-                <DropZone onDropId={() => {}}>
+                <DropZone>
                   {cart.length === 0 ? (
                     <div className="text-sm text-gray-500">
                       {t.noItemsToMove}
@@ -673,31 +1019,32 @@ export default function TransfersModal({
                                   {c.product.name}
                                 </span>
                               </div>
-                              {/* IAMS（PM） */}
+                              {/* IAMS (PM) */}
                               {(() => {
-                                const iamssid = iamsByStock.get(
-                                  (c as CartPM).stockId
-                                );
-                                if (!iamssid) return null;
-                                return (
+                                if (c.type !== "pm") return null;
+                                const snap = c as CartPM;
+                                const iamssid =
+                                  iamsByStock.get(snap.stockId) ||
+                                  snap.iamsId ||
+                                  null;
+                                return iamssid ? (
                                   <div className="text-sm text-gray-600 dark:text-gray-300">
                                     IAMS:{" "}
                                     <span className="font-mono text-purple-700 dark:text-purple-300">
                                       {iamssid}
                                     </span>
                                   </div>
-                                );
+                                ) : null;
                               })()}
                               <div className="text-xs text-gray-600 dark:text-gray-300">
                                 <span className="text-red-600 dark:text-red-200">
-                                  {" "}
-                                  {c.product.model}{" "}
-                                </span>
+                                  {c.product.model}
+                                </span>{" "}
                                 ・{c.product.brand}
                               </div>
                               <div className="text-xs text-gray-500">
                                 {t.from}
-                                {c.fromPath.join(" → ")}
+                                {(c as any).fromPath.join(" → ")}
                               </div>
                             </div>
 
@@ -731,11 +1078,15 @@ export default function TransfersModal({
                                   max={(c as CartNonPM).maxQuantity}
                                   value={(c as CartNonPM).quantity}
                                   onChange={(e) => {
+                                    const raw = parseInt(
+                                      e.target.value || "1",
+                                      10
+                                    );
                                     const val = Math.max(
                                       1,
                                       Math.min(
                                         (c as CartNonPM).maxQuantity,
-                                        parseInt(e.target.value || "1", 10)
+                                        isNaN(raw) ? 1 : raw
                                       )
                                     );
                                     setCart((prev) =>
@@ -759,8 +1110,8 @@ export default function TransfersModal({
                                           ? ({
                                               ...x,
                                               quantity: Math.min(
-                                                (x as CartNonPM).maxQuantity,
-                                                (x as CartNonPM).quantity + 1
+                                                (c as CartNonPM).maxQuantity,
+                                                (c as CartNonPM).quantity + 1
                                               ),
                                             } as CartItem)
                                           : x
@@ -771,36 +1122,43 @@ export default function TransfersModal({
                                   ＋
                                 </button>
                                 <span className="text-xs text-gray-500">
-                                  / 最多 {(c as CartNonPM).maxQuantity}
+                                  / {t.availableLabel}
+                                  {(c as CartNonPM).maxQuantity}
                                 </span>
                               </div>
                             )}
 
-                            <div className="flex items-center gap-2">
-                              <span className="text-sm">
+                            <div className="grid grid-cols-1 sm:grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 min-w-0">
+                              {/* 標籤 */}
+                              <span className="text-sm whitespace-nowrap">
                                 {t.targetLocationLabel}
                               </span>
-                              <LocationField
-                                value={c.toLocation}
-                                onChange={(v) => {
-                                  const next = v;
-                                  setCart((prev) =>
-                                    prev.map((x, i) =>
-                                      i === idx
-                                        ? ({
-                                            ...x,
-                                            toLocation: next,
-                                          } as CartItem)
-                                        : x
+
+                              {/* 選單：小螢幕滿版；sm 以上固定寬度 */}
+                              <div className="min-w-0">
+                                <TreeLocationSelect
+                                  value={c.toLocation}
+                                  onChange={(next) =>
+                                    setCart((prev) =>
+                                      prev.map((x, i) =>
+                                        i === idx
+                                          ? ({
+                                              ...x,
+                                              toLocation: next,
+                                            } as CartItem)
+                                          : x
+                                      )
                                     )
-                                  );
-                                }}
-                                onlyLeaf
-                                getLabelById={locLabel}
-                                // exclude={[c.fromLocation]} // 若你想禁止選同來源，可打開這行
-                              />
+                                  }
+                                  roots={data?.locations ?? []}
+                                  placeholder={t.searchLocationPlaceholder}
+                                  widthClass="w-full sm:w-70" // 小螢幕佔滿、sm 以上維持你原本的 w-70
+                                />
+                              </div>
+
+                              {/* 移除按鈕：小螢幕靠左、sm 以上跟著第三欄 */}
                               <button
-                                className="px-2 py-1 text-xs rounded bg-red-600 text-white"
+                                className="justify-self-start sm:justify-self-auto px-2 py-1 text-xs rounded bg-red-600 text-white"
                                 onClick={() =>
                                   setCart((prev) =>
                                     prev.filter((_, i) => i !== idx)
@@ -836,10 +1194,7 @@ export default function TransfersModal({
                       disabled={cart.length === 0}
                       onClick={() => {
                         const err = validateCart();
-                        if (err) {
-                          alert(err);
-                          return;
-                        }
+                        if (err) return alert(err);
                         setConfirmOpen(true);
                       }}
                     >
@@ -847,13 +1202,13 @@ export default function TransfersModal({
                     </button>
                   </div>
                 </div>
-              </div>
+              </section>
             </DndContext>
           )}
         </div>
       </div>
 
-      {/* 確認對話框：顯示前後變化 */}
+      {/* Confirm dialog */}
       {confirmOpen && (
         <div className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center p-4">
           <div className="w-full max-w-3xl bg-white dark:bg-gray-900 rounded-2xl shadow-2xl">
@@ -878,19 +1233,19 @@ export default function TransfersModal({
                     {c.type === "non" ? ` × ${(c as CartNonPM).quantity}` : ""}
                   </div>
                   {(() => {
-                    const iamssid = iamsByStock.get((c as CartPM).stockId);
+                    if (c.type !== "pm") return null;
+                    const snap = c as CartPM;
+                    const iamssid =
+                      iamsByStock.get(snap.stockId) || snap.iamsId || null;
                     return iamssid ? (
                       <div className="text-sm mt-1">
-                        IAMS:{" "}
-                        <code>
-                          {iamssid} {"\n"}
-                        </code>
+                        IAMS: <code>{iamssid}</code>
                       </div>
                     ) : null;
                   })()}
                   <div className="text-xs mt-1">
                     {t.source}
-                    {c.fromPath.join(" → ")}
+                    {(c as any).fromPath.join(" → ")}
                   </div>
                   <div className="text-xs">
                     {t.target}

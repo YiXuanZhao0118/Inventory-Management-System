@@ -1,129 +1,114 @@
 // app/api/products/route.ts
-export const runtime = "nodejs"; // 需要 fs
-import { sortProductsInPlace } from "@/components/sortProducts";
+import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import type { Prisma } from "@prisma/client";
+import { downloadAndSaveProductImage } from "./_image";
 
-import { NextResponse } from "next/server";
-import path from "path";
-import fs from "fs";
-import { v4 as uuid } from "uuid";
-import {
-  getProducts,
-  saveProducts,
-  type ProductItem,
-} from "@/lib/db";
+export const dynamic = "force-dynamic";
 
-const PUBLIC_DIR = path.join(process.cwd(), "public");
-const IMG_DIR = path.join(PUBLIC_DIR, "product_images");
+const intOr = (s: string | null, d: number) => {
+  const n = s ? parseInt(s, 10) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : d;
+};
 
-function ensureDir(p: string) {
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+export async function GET(req: NextRequest) {
+  const url = new URL(req.url);
+  const isPMParam = (url.searchParams.get("isPM") ?? "all").toLowerCase(); // "true" | "false" | "all"
+  const q = (url.searchParams.get("q") ?? "").trim();
+  const page = intOr(url.searchParams.get("page"), 1);
+  const limit = intOr(url.searchParams.get("limit"), 20);
+
+  const iMode: Prisma.QueryMode = "insensitive";
+
+  const or: Prisma.ProductWhereInput[] = q
+    ? [
+        { name: { contains: q, mode: iMode } },
+        { model: { contains: q, mode: iMode } },
+        { brand: { contains: q, mode: iMode } },
+      ]
+    : [];
+
+  const where: Prisma.ProductWhereInput = {
+    ...(isPMParam === "true" ? { isPropertyManaged: true } : {}),
+    ...(isPMParam === "false" ? { isPropertyManaged: false } : {}),
+    ...(or.length ? { OR: or } : {}),
+  };
+
+  const total = await prisma.product.count({ where });
+
+  const items = await prisma.product.findMany({
+    where,
+    select: {
+      id: true,
+      name: true,
+      model: true,
+      brand: true,
+      specifications: true,
+      price: true,
+      imageLink: true,
+      localImage: true,
+      isPropertyManaged: true,
+    },
+    orderBy: [{ brand: "asc" }, { model: "asc" }, { name: "asc" }, { createdAt: "desc" }],
+    skip: (page - 1) * limit,
+    take: limit,
+  });
+
+  return NextResponse.json({
+    items,
+    page: {
+      page,
+      pageSize: limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    },
+  });
 }
 
-function extFrom(contentType: string | null, urlPath: string) {
-  const ct = (contentType || "").toLowerCase();
-  if (ct.startsWith("image/")) {
-    const t = ct.split("/")[1];
-    if (t === "jpeg") return "jpg";
-    if (t === "svg+xml") return "svg";
-    return t;
-  }
-  const ext = path.extname(urlPath).replace(".", "").toLowerCase();
-  if (["jpg", "jpeg", "png", "webp", "gif", "svg"].includes(ext)) {
-    return ext === "jpeg" ? "jpg" : ext;
-  }
-  return "jpg";
-}
-
-async function tryDownload(imageUrl: string, id: string): Promise<string | null> {
-  if (!imageUrl) return null;
-
+export async function POST(req: NextRequest) {
+  let body: any;
   try {
-    ensureDir(IMG_DIR);
-
-    const res = await fetch(imageUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer": "https://www.thorlabs.com/",
-      },
-      redirect: "follow",
-      cache: "no-store",
-    });
-
-    if (!res.ok) {
-      const snippet = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status} ${res.statusText} – ${snippet.slice(0, 200)}`);
-    }
-
-    const buf = Buffer.from(await res.arrayBuffer());
-    const ext = extFrom(res.headers.get("content-type"), new URL(imageUrl).pathname);
-    const filename = `${id}.${ext}`;
-    fs.writeFileSync(path.join(IMG_DIR, filename), buf);
-    return `/product_images/${filename}`;
-  } catch (e: any) {
-    console.error("[products:image-download]", imageUrl, e?.message || e);
-    return null;
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ ok: false, message: "Invalid JSON body" }, { status: 400 });
   }
-}
 
-export async function GET() {
-  const products = getProducts();
-  return NextResponse.json(products);
-}
+  const {
+    name = "",
+    brand = "",
+    model = "",
+    specifications = "",
+    price = null,
+    imageLink = null,
+    isPropertyManaged = false,
+  } = body || {};
 
-export async function POST(req: Request) {
-  try {
-    const body = await req.json();
+  // brand + model unique
+  const dup = await prisma.product.findFirst({ where: { brand, model } });
+  if (dup) return NextResponse.json({ ok: false, message: "Duplicated brand & model" }, { status: 400 });
 
-    const name = String(body.name ?? "").trim();
-    const brand = String(body.brand ?? "").trim();
-    const model = String(body.model ?? "").trim();
-    const specifications = String(body.specifications ?? "").trim();
-    const price = Number(body.price ?? 0);
-    const imageLink = String(body.imageLink ?? "").trim();
-    const isPropertyManaged = Boolean(body.isPropertyManaged);
-
-    if (!name || !brand || !model || !specifications) {
-      return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
-    }
-    if (Number.isNaN(price) || price < 0) {
-      return NextResponse.json({ error: "Invalid price" }, { status: 400 });
-    }
-
-    const list = getProducts();
-    const norm = (s: string) => s.trim().toLowerCase();
-    const duplicate = list.some(
-      (p) => norm(p.brand) === norm(brand) && norm(p.model) === norm(model)
-    );
-    if (duplicate) {
-      return NextResponse.json(
-        { error: "Product already exists (brand+model duplicate)" },
-        { status: 409 }
-      );
-    }
-
-    const id = uuid();
-    const localImage = imageLink ? await tryDownload(imageLink, id) : null;
-
-    const item: ProductItem = {
-      id,
+  // create product first (localImage not set yet)
+  const created = await prisma.product.create({
+    data: {
       name,
       brand,
       model,
       specifications,
-      price,
+      price: price == null ? null : Number(price), // 若需要更嚴謹可改用 Prisma.Decimal
       imageLink,
-      localImage, // 若下載失敗會是 null
-      isPropertyManaged,
-    };
+      isPropertyManaged: !!isPropertyManaged,
+    },
+  });
 
-    saveProducts([...list, item]);
-    await sortProductsInPlace(); 
-    return NextResponse.json(item, { status: 201 });
-  } catch (err: any) {
-    console.error("[products POST]", err);
-    return NextResponse.json({ error: err?.message ?? "Unexpected error" }, { status: 500 });
+  // try download image
+  if (imageLink) {
+    try {
+      const { localImageRel } = await downloadAndSaveProductImage(created.id, imageLink);
+      await prisma.product.update({ where: { id: created.id }, data: { localImage: localImageRel } });
+    } catch {
+      // keep localImage = null on failure
+    }
   }
+
+  return NextResponse.json({ ok: true, id: created.id });
 }

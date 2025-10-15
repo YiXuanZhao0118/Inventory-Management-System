@@ -1,9 +1,9 @@
-# ProductInformation\analyze_cli.py
+# ProductInformation/analyze_cli.py
 import sys
 import json
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs, urljoin
+from urllib.parse import urlparse, parse_qs, urljoin, unquote_plus
 import re
 import html
 import unicodedata
@@ -251,20 +251,18 @@ def find_image_thorlabs(soup: BeautifulSoup, base_url: str, model: str | None = 
         if _is_good_img_url(u):
             candidates.append(u)
 
-    # 排序：1) 是否含 -lrg 2) 是否在 /images/large/ 3) 檔名是否含 model 4) 字串長度（短優先）
+    # 排序
     def rank(u: str):
         ul = u.lower()
         is_lrg = 0 if re.search(r"[-_]lrg\.(?:jpe?g|png|webp)$", ul) else 1
         in_large = 0 if "/images/large/" in ul else (1 if "/images/highres/" in ul else 2)
         has_model = 0
         if model:
-            # 檔名含型號會更優先
             fn = ul.rsplit("/", 1)[-1]
             if re.search(re.escape(model.lower()), fn):
                 has_model = -1
         return (is_lrg, in_large, has_model, len(ul))
 
-    # 去重
     uniq = []
     seen = set()
     for c in candidates:
@@ -276,7 +274,7 @@ def find_image_thorlabs(soup: BeautifulSoup, base_url: str, model: str | None = 
         uniq.sort(key=rank)
         return uniq[0]
 
-    # D) 最後備援：從 meta 取圖，但過濾 logo
+    # D) 備援 meta
     for key in (("property","og:image"),("name","og:image"),
                 ("property","twitter:image"),("name","twitter:image")):
         tag = soup.find("meta", {key[0]: key[1]})
@@ -322,7 +320,6 @@ def parse_thorlabs(url, soup: BeautifulSoup):
             tail = title_text[len(model):].strip()
             tail = re.sub(r'^[\s\-–—:,]+', '', tail)
         if not model:
-            # 從標題抓一個可能的料號
             m = re.search(r"\b([A-Z0-9]{1,10}(?:-[A-Z0-9]+)*)\b", title_text)
             if m:
                 model = m.group(1)
@@ -360,6 +357,194 @@ def parse_thorlabs(url, soup: BeautifulSoup):
         "imagelink": norm_url(imagelink),
     }
 
+# ---------- Mini-Circuits 解析 ----------
+# ---------- Mini-Circuits 解析（修正版） ----------
+def _host_is_minicircuits(host: str) -> bool:
+    parts = host.lower().split(".")
+    return len(parts) >= 2 and parts[-2] == "minicircuits"
+
+def _grab_table_value_by_label(soup: BeautifulSoup, label_regex: str):
+    """
+    在「label 在左、值在右」的表格或區塊抓取值。僅抓同一列/兄弟節點，避免越界誤抓（例如 VSWR）。
+    """
+    node = soup.find(lambda t: t.get_text(strip=True) and re.search(label_regex, t.get_text(strip=True), re.I))
+    if not node:
+        return None
+
+    # 1) <th>Label</th><td>Value</td>
+    if node.name in ("th", "td"):
+        tr = node.find_parent("tr")
+        if tr:
+            cells = tr.find_all(["td", "th"])
+            # 找到 label cell，取其右側第一個 td/th
+            for i, c in enumerate(cells):
+                if c is node:
+                    # 右側下一格
+                    for j in range(i + 1, len(cells)):
+                        vtxt = clean_text(cells[j].get_text(" ", strip=True))
+                        if vtxt:
+                            return vtxt
+                    break
+
+    # 2) <div>Label</div><div>Value</div>
+    sib = node.find_next_sibling()
+    if sib and sib.get_text(strip=True):
+        return clean_text(sib.get_text(" ", strip=True))
+
+    # 3) 退而求其次：同層下一個 td
+    td = node.find_next("td")
+    if td and td.get_text(strip=True):
+        return clean_text(td.get_text(" ", strip=True))
+
+    return None
+
+def _minicircuits_pick_image(soup: BeautifulSoup, base_url: str) -> str | None:
+    # 1) 優先 /images/case_style/*.png
+    for tag in soup.find_all(["img", "source", "a", "link", "meta"]):
+        for attr in ("src", "data-src", "href", "data-original", "content"):
+            v = tag.get(attr)
+            if not v:
+                continue
+            v = v.strip()
+            if "/images/case_style/" in v and v.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                return urljoin(base_url, v)
+
+    # 2) OpenGraph / Twitter
+    for key in (("property", "og:image"), ("name", "og:image"),
+                ("property", "twitter:image"), ("name", "twitter:image")):
+        tag = soup.find("meta", {key[0]: key[1]})
+        if tag and tag.get("content"):
+            return urljoin(base_url, tag["content"].strip())
+
+    # 3) Heuristic
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or img.get("data-original")
+        if not src:
+            continue
+        cls = " ".join(img.get("class", [])).lower()
+        iid = (img.get("id") or "").lower()
+        if any(k in (cls + " " + iid) for k in ["product", "main", "detail", "primary"]):
+            return urljoin(base_url, src.strip())
+
+    return None
+
+def parse_minicircuits(url: str, soup: BeautifulSoup):
+    from urllib.parse import unquote_plus
+
+    host = urlparse(url).netloc
+    if not _host_is_minicircuits(host):
+        return None
+
+    brand = "Mini-Circuits"
+
+    # ---- 模型（型號）優先用 URL query 的 model（保留 +）----
+    qs = parse_qs(urlparse(url).query)
+    model = (qs.get("model", [None])[0] or "").strip() or None
+    if model:
+        model = unquote_plus(model)  # FW-15A%2B -> FW-15A+
+    # 從 <title> 右側的「| 型號」作為備援/修正（保留 +）
+    if True:
+        _title = clean_text((soup.find("title") or {}).get_text() if soup.find("title") else None) or ""
+        # 例：「15 dB Fixed Attenuator, DC - 12000 MHz, 50Ω | FW-15A+」
+        m = re.search(r"\|\s*([A-Z0-9][A-Z0-9+\-]+)\s*$", _title, re.I)
+        if m:
+            title_model = m.group(1).strip()
+            # 若 URL 沒帶 + 或不一致，偏好 title 的版本（常含 +）
+            if not model or (len(title_model) >= len(model) and "+" in title_model and "+" not in (model or "")):
+                model = title_model
+
+    # ---- 名稱與規格：先把「| 型號」切掉，再用逗號拆 name/spec ----
+    title_tag = soup.find("title")
+    title_text = clean_text(title_tag.get_text()) if title_tag else None
+    if not title_text:
+        og = soup.find("meta", property="og:title")
+        if og and og.get("content"):
+            title_text = clean_text(og["content"])
+
+    name = None
+    spec = None
+    if title_text:
+        # 切掉站名與型號尾巴
+        t = re.sub(r"\s*\|\s*Mini[-\s]?Circuits\s*$", "", title_text, flags=re.I)
+        t = re.sub(r"\s*\|\s*[A-Z0-9][A-Z0-9+\-]+\s*$", "", t, flags=re.I)  # 去掉「| FW-15A+」
+        # 現在 t 應該像「15 dB Fixed Attenuator, DC - 12000 MHz, 50Ω」
+        parts = [p.strip(" -–—,:") for p in t.split(",") if p.strip()]
+        if parts:
+            name = parts[0] or None
+            if len(parts) > 1:
+                # 其餘合併為 spec（通常包含頻寬與阻抗）
+                spec = ", ".join(parts[1:])
+
+    # 若還沒拿到頻寬/阻抗，補抓一遍（避免把 VSWR 當阻抗）
+    # 頻寬
+    if not spec or "MHz" not in spec:
+        freq = _grab_table_value_by_label(soup, r"\b(Frequency\s*Range|Frequency\s*Band)\b")
+        if not freq:
+            m = re.search(r"\bDC\s*-\s*[\d,]+(?:\.\d+)?\s*MHz\b", soup.get_text(" ", strip=True), re.I)
+            if m:
+                freq = m.group(0).replace(",", "")
+    else:
+        # 從 spec 裡切出第一段 MHz 片段
+        m = re.search(r"\b(?:DC|[\d\.]+)\s*-\s*[\d,]+(?:\.\d+)?\s*MHz\b", spec, re.I)
+        freq = m.group(0).replace(",", "") if m else None
+
+    # 阻抗（只接受含 ohm/Ω 字樣的數字，避免抓到 VSWR 1.4）
+    imp = None
+    # 先試表格的「Impedance」
+    imp_raw = _grab_table_value_by_label(soup, r"\bImpedance\b")
+    txt_pool = [imp_raw or "", spec or "", soup.get_text(" ", strip=True)]
+    for blob in txt_pool:
+        m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:ohms?|Ω|Ω)\b", blob, re.I)
+        if m:
+            imp = f"{m.group(1)}Ω"
+            break
+    if not imp:
+        # 常見 50 ohm
+        if re.search(r"\b50\s*(?:ohms?|Ω|Ω)\b", soup.get_text(" ", strip=True), re.I):
+            imp = "50Ω"
+
+    # 重建 spec：freq 與 imp 有就用這兩個，否則保留前面拆到的 spec
+    if freq or imp:
+        spec = ", ".join([x for x in [freq, imp] if x])
+    spec = normalize_for_output(spec)
+
+    # 主圖
+    imagelink = _minicircuits_pick_image(soup, url)
+    if not imagelink:
+        imagelink = find_image_generic(soup, url)
+
+    # 價格（先通用）
+    price = find_price_generic(soup)
+    if price is None:
+        # 再掃「Price $…」
+        txt = soup.get_text(" ", strip=True)
+        m = re.search(r"\bPrice\b[^$]*\$\s*([\d,]+(?:\.\d{1,2})?)", txt, re.I)
+        if m:
+            try:
+                price = float(m.group(1).replace(",", ""))
+            except Exception:
+                price = None
+
+    # URL 正規化
+    def norm_url(u):
+        if not u:
+            return None
+        absu = urljoin(url, str(u).strip())
+        if absu.startswith("//"):
+            absu = "https:" + absu
+        if absu.startswith("http://"):
+            absu = "https://" + absu[len("http://"):]
+        return absu
+
+    return {
+        "name": normalize_for_output(name),
+        "brand": normalize_for_output(brand),
+        "model": normalize_for_output(model),   # 會保留 '+'
+        "price": price,
+        "spec": spec,
+        "imagelink": norm_url(imagelink),
+    }
+
 # ---------- Main ----------
 def main():
     if len(sys.argv) < 2:
@@ -377,7 +562,13 @@ def main():
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Thorlabs 優先
+    # Mini-Circuits 優先
+    hit = parse_minicircuits(url, soup)
+    if hit:
+        print(json.dumps(hit, ensure_ascii=False))
+        return
+
+    # Thorlabs
     hit = parse_thorlabs(url, soup)
     if hit:
         print(json.dumps(hit, ensure_ascii=False))

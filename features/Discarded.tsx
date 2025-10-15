@@ -1,54 +1,62 @@
-// features/Discarded.tsx
 "use client";
-
+import { Trash2 } from "lucide-react";
 import React, { useEffect, useMemo, useState } from "react";
-import useSWR from "swr";
 import { Archive, Package } from "lucide-react";
-import { fetcher } from "@/services/apiClient";
-
-// ✅ i18n
-import { useLanguage } from "@/components/LanguageSwitcher";
+import { useJson } from "@/hooks/useJson";
+import { useLanguage } from "@/src/components/LanguageSwitcher";
 import zhTW from "@/app/data/language/zh-TW.json";
 import enUS from "@/app/data/language/en-US.json";
 import hiIN from "@/app/data/language/hi.json";
 import deDE from "@/app/data/language/de.json";
 
-type IAMSMap = { stockid: string; IAMSID: string };
-// 抽出數字，讓 4031-4040-30020267、IAMS4031404030020267 都能比對
-const digits = (s?: string) => (s ? s.replace(/\D+/g, "") : "");
+/* ========== 工具 ========== */
+const qs = (o: Record<string, any>) =>
+  "?" +
+  Object.entries(o)
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    .map(
+      ([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`
+    )
+    .join("&");
 
-type BulkStatus = "in_stock" | "long_term";
+/* ========== 型別 ========== */
+type ProductLite = { id: string; name: string; model: string; brand: string };
 
-type PMItem = {
+type PMApiItem = {
   stockId: string;
-  product: { id: string; name: string; model: string; brand: string };
+  product: ProductLite;
   locationId: string;
   locationPath: string[];
-  currentStatus: BulkStatus;
+  currentStatus: "in_stock" | "short_term" | "long_term" | "discarded";
+  iamsId?: string | null;
 };
 
-type NonPMGroup = {
-  productId: string;
-  product: { id: string; name: string; model: string; brand: string };
+type NonApiItem = {
+  product: ProductLite;
   locationId: string;
   locationPath: string[];
-  quantity: number; // available at source
-  currentStatus: BulkStatus;
+  quantity: number;
+  currentStatus: "in_stock" | "short_term" | "long_term" | "discarded";
 };
 
-type GetResp = {
-  propertyManaged: PMItem[];
-  nonPropertyManaged: NonPMGroup[];
-};
+type PagedResp<T> = { items: T[] }; // 如需 total/page 可擴充
 
-type CartPM = { type: "pm"; stockId: string };
+// 放入購物籃的型別（多存快照避免換頁不見）
+type CartPM = {
+  type: "pm";
+  stockId: string;
+  product?: ProductLite;
+  locationPath?: string[];
+  iamsId?: string | null;
+};
 type CartNonPM = {
   type: "non";
   productId: string;
   locationId: string;
-  currentStatus: BulkStatus;
   quantity: number;
   max: number;
+  product?: ProductLite;
+  locationPath?: string[];
 };
 type CartItem = CartPM | CartNonPM;
 
@@ -59,21 +67,9 @@ export default function DiscardedModal({
   isOpen: boolean;
   onClose: () => void;
 }) {
+  const PAGE_SIZE = 20;
 
-  const { data: iamsData } = useSWR<IAMSMap[]>("/api/iams", fetcher);
-  const iamsByStock = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const r of iamsData ?? []) {
-      if (r?.stockid && r?.IAMSID) m.set(r.stockid, r.IAMSID);
-    }
-    return m;
-  }, [iamsData]);
-
-  const { data, error } = useSWR<GetResp>("/api/discarded", fetcher, {
-    revalidateOnFocus: true,
-  });
-
-  // ✅ i18n mapping
+  // i18n
   const { language } = useLanguage();
   const tMap: Record<string, any> = {
     "zh-TW": zhTW,
@@ -84,88 +80,67 @@ export default function DiscardedModal({
   const t = (tMap[language] || zhTW).DiscardedModal;
 
   const [message, setMessage] = useState<string | null>(null);
+
+  // 搜尋與分頁（左右獨立）
   const [searchPM, setSearchPM] = useState("");
   const [searchNon, setSearchNon] = useState("");
+  const [pmPage, setPmPage] = useState(1);
+  const [nonPage, setNonPage] = useState(1);
 
-  // 狀態篩選（多選）
-  const AVAILABLE: BulkStatus[] = ["in_stock", "long_term"];
-  const [selectedStatuses, setSelectedStatuses] = useState<BulkStatus[]>([
-    "in_stock",
-    "long_term",
-  ]);
-  const toggleStatus = (st: BulkStatus) =>
-    setSelectedStatuses((arr) =>
-      arr.includes(st) ? arr.filter((x) => x !== st) : [...arr, st]
-    );
+  useEffect(() => setPmPage(1), [searchPM]);
+  useEffect(() => setNonPage(1), [searchNon]);
 
-  // ====== 來源清單處理 ======
-  const allPM = data?.propertyManaged ?? [];
-  const allNon = data?.nonPropertyManaged ?? [];
+  // API Key（僅 in_stock）
+  const pmKey = useMemo(
+    () =>
+      `/api/inventory/pm${qs({
+        status: "in_stock",
+        q: searchPM.trim(),
+        page: pmPage,
+        limit: PAGE_SIZE,
+      })}`,
+    [searchPM, pmPage]
+  );
+  const nonKey = useMemo(
+    () =>
+      `/api/inventory/nonpm${qs({
+        status: "in_stock",
+        q: searchNon.trim(),
+        page: nonPage,
+        limit: PAGE_SIZE,
+      })}`,
+    [searchNon, nonPage]
+  );
 
-  // 依狀態與搜尋過濾（PM）
-  const pmList = useMemo(() => {
-    const base = allPM.filter((i) => selectedStatuses.includes(i.currentStatus));
-    const q = searchPM.trim().toLowerCase();
-    if (!q) return base;
+  const { data: pmRes } = useJson<PagedResp<PMApiItem>>(pmKey);
+  const { data: nonRes } = useJson<PagedResp<NonApiItem>>(nonKey);
 
-    const qDigits = digits(q);
+  // IAMS map（顯示用）
+  const iamsByStock = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const s of pmRes?.items ?? [])
+      if (s.iamsId) m.set(s.stockId, s.iamsId);
+    return m;
+  }, [pmRes?.items]);
 
-    return base.filter((i) => {
-      const baseHit = [
-        i.stockId,
-        i.product.name,
-        i.product.model,
-        i.product.brand,
-        i.locationPath.join(" "),
-      ]
-        .join(" ")
-        .toLowerCase()
-        .includes(q);
+  const allPM = pmRes?.items ?? [];
+  const allNon = nonRes?.items ?? [];
 
-      const iamssid = iamsByStock.get(i.stockId) || "";
-      const iamsHit =
-        (iamssid && iamssid.toLowerCase().includes(q)) ||
-        (!!qDigits && digits(iamssid).includes(qDigits));
-
-      // 額外允許用純數字比對 stockId（若你的 ID 也有數字）
-      const idDigitsHit = !!qDigits && digits(i.stockId).includes(qDigits);
-
-      return baseHit || iamsHit || idDigitsHit;
-    });
-  }, [allPM, selectedStatuses, searchPM, iamsByStock]);
-
-
-  // 依狀態與搜尋過濾（Non-PM）
-  const nonList = useMemo(() => {
-    const base = allNon.filter((g) => selectedStatuses.includes(g.currentStatus));
-    if (!searchNon.trim()) return base;
-    const q = searchNon.trim().toLowerCase();
-    return base.filter((g) =>
-      [
-        g.productId,
-        g.product.name,
-        g.product.model,
-        g.product.brand,
-        g.locationPath.join(" "),
-      ]
-        .join(" ")
-        .toLowerCase()
-        .includes(q)
-    );
-  }, [allNon, selectedStatuses, searchNon]);
-
-  // ====== 選擇區 ======
+  /* ========== 選擇區（購物籃） ========== */
   const [cart, setCart] = useState<CartItem[]>([]);
 
-  // 後端資料變動時，校正非財 cart 的 max/quantity
+  // Non-PM 若本頁有相同項目，更新 max；不在本頁就保留原 max
   useEffect(() => {
-    if (!data) return;
     setCart((prev) => {
       let changed = false;
       const next = prev.map((c) => {
         if (c.type === "non") {
           const n = c as CartNonPM;
-          const newMax = getCap(n.productId, n.locationId, n.currentStatus);
+          const row = allNon.find(
+            (g) => g.product.id === n.productId && g.locationId === n.locationId
+          );
+          if (!row) return c;
+          const newMax = row.quantity;
           const newQty = Math.min(n.quantity, newMax);
           if (newMax !== n.max || newQty !== n.quantity) {
             changed = true;
@@ -176,31 +151,60 @@ export default function DiscardedModal({
       });
       return changed ? next : prev;
     });
-  }, [data]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [allNon]);
 
-  const addPM = (stockId: string) =>
+  // 加入 PM
+  const addPMFromItem = (item: PMApiItem) =>
     setCart((prev) =>
-      prev.some((x) => x.type === "pm" && x.stockId === stockId)
+      prev.some(
+        (x) => x.type === "pm" && (x as CartPM).stockId === item.stockId
+      )
         ? prev
-        : [...prev, { type: "pm", stockId }]
+        : [
+            ...prev,
+            {
+              type: "pm",
+              stockId: item.stockId,
+              product: item.product,
+              locationPath: item.locationPath,
+              iamsId: item.iamsId ?? null,
+            } as CartPM,
+          ]
     );
+  const addPMById = (stockId: string) => {
+    const found = allPM.find((s) => s.stockId === stockId);
+    if (found) return addPMFromItem(found);
+    setCart((prev) =>
+      prev.some((x) => x.type === "pm" && (x as CartPM).stockId === stockId)
+        ? prev
+        : [...prev, { type: "pm", stockId } as CartPM]
+    );
+  };
 
-  const addNon = (productId: string, locationId: string, currentStatus: BulkStatus) =>
+  // 加入 Non-PM
+  const addNonFromItem = (g: NonApiItem) =>
     setCart((prev) => {
+      const productId = g.product.id;
+      const locationId = g.locationId;
       const idx = prev.findIndex(
         (x) =>
           x.type === "non" &&
           (x as CartNonPM).productId === productId &&
-          (x as CartNonPM).locationId === locationId &&
-          (x as CartNonPM).currentStatus === currentStatus
+          (x as CartNonPM).locationId === locationId
       );
-      const cap = getCap(productId, locationId, currentStatus);
+      const cap = g.quantity;
       if (cap <= 0) return prev;
       if (idx >= 0) {
         const cur = prev[idx] as CartNonPM;
         if (cur.quantity >= cur.max) return prev;
         const next = [...prev];
-        next[idx] = { ...cur, quantity: Math.min(cur.quantity + 1, cap), max: cap };
+        next[idx] = {
+          ...cur,
+          quantity: Math.min(cur.quantity + 1, cap),
+          max: cap,
+          product: g.product,
+          locationPath: g.locationPath,
+        };
         return next;
       }
       return [
@@ -209,78 +213,74 @@ export default function DiscardedModal({
           type: "non",
           productId,
           locationId,
-          currentStatus,
           quantity: 1,
           max: cap,
+          product: g.product,
+          locationPath: g.locationPath,
         } as CartNonPM,
       ];
     });
-
-  // 取得目前 cap（防止後端資料更新後超量）
-  const getCap = (productId: string, locationId: string, currentStatus: BulkStatus) => {
-    const row = allNon.find(
-      (g) =>
-        g.productId === productId &&
-        g.locationId === locationId &&
-        g.currentStatus === currentStatus
+  const addNonByKeys = (productId: string, locationId: string) => {
+    const found = allNon.find(
+      (g) => g.product.id === productId && g.locationId === locationId
     );
-    return row?.quantity ?? 0;
+    if (found) addNonFromItem(found);
   };
 
-  // === PM 已加入集合（避免重複顯示） ===
-  const cartPMSet = useMemo(() => {
-    const s = new Set<string>();
-    for (const c of cart) if (c.type === "pm") s.add((c as CartPM).stockId);
-    return s;
-  }, [cart]);
-
-  // === Non-PM 已加入數量對照表 key=productId::locationId::status ===
-  const cartNonUsedMap = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const c of cart) {
-      if (c.type === "non") {
-        const n = c as CartNonPM;
-        const key = `${n.productId}::${n.locationId}::${n.currentStatus}`;
-        m.set(key, (m.get(key) ?? 0) + n.quantity);
-      }
-    }
-    return m;
-  }, [cart]);
-
-  // === PM 顯示清單（移除已加入的） ===
-  const pmListDisplay = useMemo(() => {
-    return pmList.filter((i) => !cartPMSet.has(i.stockId));
-  }, [pmList, cartPMSet]);
-
-  // === Non 顯示清單（顯示剩餘數量，0 就不顯示） ===
-  const nonListDisplay = useMemo(() => {
-    return nonList
-      .map((g) => {
-        const key = `${g.productId}::${g.locationId}::${g.currentStatus}`;
-        const used = cartNonUsedMap.get(key) ?? 0;
-        const remaining = Math.max(0, g.quantity - used);
-        return { ...g, remaining };
-      })
-      .filter((g) => g.remaining > 0);
-  }, [nonList, cartNonUsedMap]);
-
-  // 簡易拖拉
+  // DnD
   const onDragStart = (e: React.DragEvent, dragId: string) =>
     e.dataTransfer.setData("text/plain", dragId);
   const onDropToSelection = (e: React.DragEvent) => {
     e.preventDefault();
     const dragId = e.dataTransfer.getData("text/plain");
     if (!dragId) return;
-    if (dragId.startsWith("pm::")) {
-      addPM(dragId.slice(4));
-    } else if (dragId.startsWith("non::")) {
-      const [, productId, locationId, st] = dragId.split("::");
-      addNon(productId, locationId, st as BulkStatus);
+    if (dragId.startsWith("pm::")) addPMById(dragId.slice(4));
+    else if (dragId.startsWith("non::")) {
+      const [, productId, locationId] = dragId.split("::");
+      addNonByKeys(productId, locationId);
     }
   };
   const onDragOver = (e: React.DragEvent) => e.preventDefault();
 
-  // 原因/經辦 + 送出
+  // 避免清單與購物籃重複
+  const cartPMSet = useMemo(() => {
+    const s = new Set<string>();
+    for (const c of cart) if (c.type === "pm") s.add((c as CartPM).stockId);
+    return s;
+  }, [cart]);
+  const cartNonUsedMap = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const c of cart)
+      if (c.type === "non") {
+        const n = c as CartNonPM;
+        const key = `${n.productId}::${n.locationId}`;
+        m.set(key, (m.get(key) ?? 0) + n.quantity);
+      }
+    return m;
+  }, [cart]);
+
+  const pmListDisplay = useMemo(
+    () => allPM.filter((i) => !cartPMSet.has(i.stockId)),
+    [allPM, cartPMSet]
+  );
+  const nonListDisplay = useMemo(
+    () =>
+      allNon
+        .map((g) => {
+          const key = `${g.product.id}::${g.locationId}`;
+          const used = cartNonUsedMap.get(key) ?? 0;
+          const remaining = Math.max(0, g.quantity - used);
+          return { ...g, remaining };
+        })
+        .filter((g) => g.remaining > 0),
+    [allNon, cartNonUsedMap]
+  );
+
+  // 是否還有下一頁（簡易：本頁數量 == PAGE_SIZE）
+  const pmHasNext = (pmRes?.items?.length ?? 0) === PAGE_SIZE;
+  const nonHasNext = (nonRes?.items?.length ?? 0) === PAGE_SIZE;
+
+  // 送出（reason / operator）
   const [reason, setReason] = useState("");
   const [operator, setOperator] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -294,39 +294,36 @@ export default function DiscardedModal({
     setConfirmOpen(true);
   };
 
-  const buildPayload = () => {
-    const items: Array<
-      | { stockId: string }
-      | { productId: string; locationId: string; currentStatus: BulkStatus; quantity: number }
-    > = [];
-    for (const c of cart) {
-      if (c.type === "pm") {
-        items.push({ stockId: (c as CartPM).stockId });
-      } else {
-        const n = c as CartNonPM;
-        if (n.quantity > 0) {
-          items.push({
-            productId: n.productId,
-            locationId: n.locationId,
-            currentStatus: n.currentStatus,
-            quantity: n.quantity,
-          });
-        }
-      }
-    }
-    return { reason: reason.trim(), operator: operator.trim(), items };
+  const buildPayloadV2 = () => {
+    const pmRows = cart
+      .filter((c) => c.type === "pm")
+      .map((c) => ({ stockId: (c as CartPM).stockId }));
+    const nonRows = cart
+      .filter((c) => c.type === "non")
+      .map((c) => ({
+        ProductId: (c as CartNonPM).productId,
+        LocationId: (c as CartNonPM).locationId,
+        quantity: (c as CartNonPM).quantity,
+      }));
+    return {
+      reason: reason.trim(),
+      operator: operator.trim(),
+      PropertyManaged: pmRows,
+      nonPropertyManaged: nonRows,
+    };
   };
 
   const doSubmit = async () => {
     setPosting(true);
     try {
-      const res = await fetch("/api/discarded", {
+      const res = await fetch("/api/inventory/discard", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildPayload()),
+        body: JSON.stringify(buildPayloadV2()),
       });
       const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
+      if (!res.ok || j?.ok === false)
+        throw new Error(j?.message || `HTTP ${res.status}`);
 
       setMessage(t.submitSuccess);
       setCart([]);
@@ -335,17 +332,19 @@ export default function DiscardedModal({
       setConfirmOpen(false);
     } catch (e: any) {
       setMessage(`${t.submitFailed} ${(e?.message || e) as string}`);
-      setTimeout(() => {
-        setMessage(null);
-      }, 500);
+      setTimeout(() => setMessage(null), 600);
     } finally {
       setPosting(false);
     }
   };
 
-  const prettyStatus = (st: BulkStatus) => (st === "in_stock" ? t.statusInStock : t.statusLongTerm);
-
   if (!isOpen) return null;
+
+  // helper for頁碼文案
+  const pageText = (page: number) =>
+    String(t.pageIndicator)
+      .replace("{page}", String(page))
+      .replace("{pageSize}", String(PAGE_SIZE));
 
   return (
     <div
@@ -358,20 +357,20 @@ export default function DiscardedModal({
       <div className="w-full max-w-7xl h-[calc(100vh-2rem)] bg-white dark:bg-gray-900 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-3 border-b dark:border-gray-700">
-          <h2 className="text-xl font-semibold">🗑️ {t.title}</h2>
+          <h2 className="text-xl font-semibold text-gray-900 dark:text-white inline-flex items-center gap-2">
+            <Trash2 className="w-6 h-6" aria-hidden="true" />
+            {t.title}
+          </h2>
           <button onClick={onClose} className="text-red-500 hover:underline">
             {t.close}
           </button>
         </div>
 
-        {error && (
-          <div className="p-6 text-red-600">
-            {t.loadFailed}: {(error as Error).message}
-          </div>
+        {!pmRes && !nonRes && (
+          <div className="p-6 text-gray-600">{t.loading}</div>
         )}
-        {!data && !error && <div className="p-6 text-gray-600">{t.loading}</div>}
 
-        {data && (
+        {(pmRes || nonRes) && (
           <div className="p-6 space-y-6 flex-1 overflow-y-auto">
             {message && (
               <div
@@ -382,41 +381,15 @@ export default function DiscardedModal({
               </div>
             )}
 
-            {/* 狀態篩選 */}
-            <section className="p-4 rounded-xl border dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
-              <div className="flex items-center gap-3 flex-wrap">
-                <span className="text-sm text-gray-600 dark:text-gray-300">
-                  {t.filterStatusLabel}
-                </span>
-                {AVAILABLE.map((st) => {
-                  const active = selectedStatuses.includes(st);
-                  return (
-                    <button
-                      key={st}
-                      className={`px-3 py-1 rounded-full border text-sm ${
-                        active
-                          ? "bg-indigo-600 text-white border-indigo-600"
-                          : "bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 border-gray-300 dark:border-gray-700"
-                      }`}
-                      onClick={() => toggleStatus(st)}
-                      title={t.statusTooltip}
-                    >
-                      {st === "in_stock" ? t.statusInStock : t.statusLongTerm}
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
-
-            {/* 兩欄：PM / NonPM */}
+            {/* 兩欄：PM / Non-PM */}
             <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {/* PM（逐一） */}
+              {/* PM */}
               <div className="p-4 rounded-xl border dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
                     <Archive className="w-4 h-4 text-indigo-600" />
                     <h3 className="text-base font-semibold">{t.pmTitle}</h3>
-                  </div>  
+                  </div>
                   <input
                     className="px-2 py-1 border rounded dark:bg-gray-800 dark:border-gray-700"
                     placeholder={t.searchPlaceholder}
@@ -424,6 +397,7 @@ export default function DiscardedModal({
                     onChange={(e) => setSearchPM(e.target.value)}
                   />
                 </div>
+
                 <div className="grid gap-3 max-h-[420px] overflow-auto pr-1">
                   {pmListDisplay.length === 0 && (
                     <div className="text-sm text-gray-500">{t.noItems}</div>
@@ -436,91 +410,167 @@ export default function DiscardedModal({
                       className="p-3 rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 hover:shadow-sm transition flex items-start gap-3"
                     >
                       <div className="flex-1">
-                        <div className="text-sm font-medium">{s.product.name}</div>
+                        <div className="text-sm font-medium">
+                          {s.product.name}
+                        </div>
                         <div className="text-sm text-gray-600 dark:text-gray-300">
-                          {t.model} <span className="text-red-600 dark:text-red-200"> {s.product.model} </span>・{t.brand} {s.product.brand}
+                          {t.model}{" "}
+                          <span className="text-red-600 dark:text-red-200">
+                            {s.product.model}
+                          </span>
+                          ・{t.brand} {s.product.brand}
                         </div>
                         <div className="text-xs text-gray-600 dark:text-gray-400">
-                          ID: <span className="text-blue-600 dark:text-blue-200"><code>{s.stockId}</code></span>
+                          {t.idLabel}:{" "}
+                          <span className="text-blue-600 dark:text-blue-200">
+                            <code>{s.stockId}</code>
+                          </span>
                         </div>
-                        {/* ✅ 新增：IAMS（有才顯示） */}
-                        {iamsByStock.get(s.stockId) && (
+                        {s.iamsId ? (
                           <div className="text-xs text-gray-600 dark:text-gray-400">
-                            IAMS:{" "}
+                            {t.iamsLabel}:{" "}
                             <span className="font-mono text-purple-700 dark:text-purple-300">
-                              {iamsByStock.get(s.stockId)}
+                              {s.iamsId}
                             </span>
                           </div>
-                        )}
-                        <div className="text-xs text-gray-500 dark:text-gray-400">
-                          {s.locationPath.join(" → ")}
-                        </div>
+                        ) : null}
                         <div className="text-xs text-gray-600 dark:text-gray-400">
-                          {t.statusLabel} {s.currentStatus === "in_stock" ? t.statusInStock : t.statusLongTerm}
+                          {s.locationPath.join(" → ")}
                         </div>
                       </div>
                       <button
                         className="px-2 py-1 text-xs rounded bg-indigo-600 text-white"
-                        onClick={() => addPM(s.stockId)}
+                        onClick={() => addPMFromItem(s)}
                       >
                         {t.add}
                       </button>
                     </div>
                   ))}
                 </div>
+
+                {/* PM 分頁 */}
+                <div className="mt-2 flex items-center justify-between text-xs text-gray-600 dark:text-gray-300">
+                  <span>{pageText(pmPage)}</span>
+                  <div className="inline-flex items-center gap-1">
+                    <button
+                      className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                      onClick={() => setPmPage(1)}
+                      disabled={pmPage <= 1}
+                      title={t.firstPage}
+                    >
+                      «
+                    </button>
+                    <button
+                      className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                      onClick={() => setPmPage((p) => Math.max(1, p - 1))}
+                      disabled={pmPage <= 1}
+                      title={t.prevPage}
+                    >
+                      ‹
+                    </button>
+                    <button
+                      className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                      onClick={() => setPmPage((p) => p + 1)}
+                      disabled={!pmHasNext}
+                      title={t.nextPage}
+                    >
+                      ›
+                    </button>
+                  </div>
+                </div>
               </div>
 
-              {/* Non-PM（聚合） */}
+              {/* Non-PM */}
               <div className="p-4 rounded-xl border dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
                 <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2">
-                      <Package className="w-4 h-4 text-indigo-600" />
-                      <h3 className="text-base font-semibold">{t.nonPmTitle}</h3>
-                    </div>
-                    <input
+                  <div className="flex items-center gap-2">
+                    <Package className="w-4 h-4 text-indigo-600" />
+                    <h3 className="text-base font-semibold">{t.nonPmTitle}</h3>
+                  </div>
+                  <input
                     className="px-2 py-1 border rounded dark:bg-gray-800 dark:border-gray-700"
                     placeholder={t.searchPlaceholder}
                     value={searchNon}
                     onChange={(e) => setSearchNon(e.target.value)}
                   />
                 </div>
+
                 <div className="grid gap-3 max-h-[420px] overflow-auto pr-1">
                   {nonListDisplay.length === 0 && (
                     <div className="text-sm text-gray-500">{t.noItems}</div>
                   )}
                   {nonListDisplay.map((g) => (
                     <div
-                      key={`${g.productId}::${g.locationId}::${g.currentStatus}`}
+                      key={`${g.product.id}::${g.locationId}`}
                       draggable
                       onDragStart={(e) =>
-                        onDragStart(
-                          e,
-                          `non::${g.productId}::${g.locationId}::${g.currentStatus}`
-                        )
+                        onDragStart(e, `non::${g.product.id}::${g.locationId}`)
                       }
                       className="p-3 rounded-lg border dark:border-gray-700 bg-white dark:bg-gray-800 hover:shadow-sm transition flex items-start gap-3"
                     >
                       <div className="flex-1">
-                        <div className="text-sm font-medium">{g.product.name}</div>
-                          <div className="text-sm text-gray-600 dark:text-gray-300">
-                            {t.model} <span className="text-red-600 dark:text-red-200"> {g.product.model} </span>・{t.brand} {g.product.brand}
-                          </div>
-                          <div className="text-sm text-gray-600 dark:text-gray-300">{t.availableQty}: <span className="text-red-600 dark:text-red-200">{g.remaining}</span></div>
-                          <div className="text-xs text-gray-500 dark:text-gray-400">
-                            {g.locationPath.join(" → ")}
-                          </div>
-                          <div className="text-xs text-gray-600 dark:text-gray-400">
-                            {t.statusLabel} {(g.currentStatus === "in_stock" ? t.statusInStock : t.statusLongTerm)}     
-                          </div>
+                        <div className="text-sm font-medium">
+                          {g.product.name}
+                        </div>
+                        <div className="text-sm text-gray-600 dark:text-gray-300">
+                          {t.model}{" "}
+                          <span className="text-red-600 dark:text-red-200">
+                            {g.product.model}
+                          </span>
+                          ・{t.brand} {g.product.brand}
+                        </div>
+                        <div className="text-sm text-gray-600 dark:text-gray-300">
+                          {t.availableQty}:{" "}
+                          <span className="text-red-600 dark:text-red-200">
+                            {g.quantity -
+                              (cartNonUsedMap.get(
+                                `${g.product.id}::${g.locationId}`
+                              ) ?? 0)}
+                          </span>
+                        </div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400">
+                          {g.locationPath.join(" → ")}
+                        </div>
                       </div>
                       <button
                         className="ml-3 px-2 py-1 text-xs rounded bg-indigo-600 text-white"
-                        onClick={() => addNon(g.productId, g.locationId, g.currentStatus)}
+                        onClick={() => addNonFromItem(g)}
                       >
                         {t.add}
                       </button>
                     </div>
                   ))}
+                </div>
+
+                {/* Non-PM 分頁 */}
+                <div className="mt-2 flex items-center justify-between text-xs text-gray-600 dark:text-gray-300">
+                  <span>{pageText(nonPage)}</span>
+                  <div className="inline-flex items-center gap-1">
+                    <button
+                      className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                      onClick={() => setNonPage(1)}
+                      disabled={nonPage <= 1}
+                      title={t.firstPage}
+                    >
+                      «
+                    </button>
+                    <button
+                      className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                      onClick={() => setNonPage((p) => Math.max(1, p - 1))}
+                      disabled={nonPage <= 1}
+                      title={t.prevPage}
+                    >
+                      ‹
+                    </button>
+                    <button
+                      className="px-2 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-50"
+                      onClick={() => setNonPage((p) => p + 1)}
+                      disabled={!nonHasNext}
+                      title={t.nextPage}
+                    >
+                      ›
+                    </button>
+                  </div>
                 </div>
               </div>
             </section>
@@ -547,38 +597,53 @@ export default function DiscardedModal({
                         >
                           {(() => {
                             const id = (c as CartPM).stockId;
-                            const src = allPM.find(pm => pm.stockId === id);
+                            const src =
+                              allPM.find((pm) => pm.stockId === id) || null;
+                            const snap = c as CartPM;
+                            const product = src?.product || snap.product;
+                            const path =
+                              src?.locationPath ||
+                              snap.locationPath ||
+                              ([] as string[]);
+                            const iams =
+                              src?.iamsId ||
+                              snap.iamsId ||
+                              iamsByStock.get(id) ||
+                              null;
+
                             return (
                               <>
                                 <div className="min-w-0">
                                   <div className="text-sm font-medium truncate text-blue-600 dark:text-blue-200">
                                     #{id}
-                                    <span className="text-gray-600 dark:text-gray-300">                                    
-                                      {src && (
-                                      <> — {src.product.name}
-                                      {/* IAMS（PM） */}
-                                      {(() => {
-                                        const iamssid = iamsByStock.get(id);
-                                        if (!iamssid) return null;
-                                        return (
-                                          <div className="text-sm text-gray-600 dark:text-gray-300">
-                                            IAMS:{" "}
-                                            <span className="font-mono text-purple-700 dark:text-purple-300">
-                                              {iamssid}
-                                            </span>
-                                          </div>
-                                        );
-                                      })()}
-                                    <div className="text-red-600 dark:text-red-200">{src.product.model}
-                                    <span className="text-gray-600 dark:text-gray-300">・{src.product.brand}</span>
-                                    </div></>
-                                    )}</span>
+                                    {product && (
+                                      <span className="text-gray-600 dark:text-gray-300">
+                                        {" "}
+                                        — {product.name}
+                                      </span>
+                                    )}
                                   </div>
 
-                                  {/* 新增：狀態 + 路徑 */}
-                                  {src && (
+                                  {iams ? (
+                                    <div className="text-sm text-gray-600 dark:text-gray-300">
+                                      {t.iamsLabel}:{" "}
+                                      <span className="font-mono text-purple-700 dark:text-purple-300">
+                                        {iams}
+                                      </span>
+                                    </div>
+                                  ) : null}
+
+                                  {product && (
+                                    <div className="text-red-600 dark:text-red-200">
+                                      {product.model}
+                                      <span className="text-gray-600 dark:text-gray-300">
+                                        ・{product.brand}
+                                      </span>
+                                    </div>
+                                  )}
+                                  {path.length > 0 && (
                                     <div className="text-xs text-gray-600 dark:text-gray-400">
-                                      {prettyStatus(src.currentStatus)} · {src ? src.locationPath.join(" → ") : id}
+                                      {path.join(" → ")}
                                     </div>
                                   )}
                                 </div>
@@ -586,7 +651,9 @@ export default function DiscardedModal({
                                 <button
                                   className="px-2 py-1 text-xs rounded bg-red-600 text-white"
                                   onClick={() =>
-                                    setCart((prev) => prev.filter((_, i) => i !== idx))
+                                    setCart((prev) =>
+                                      prev.filter((_, i) => i !== idx)
+                                    )
                                   }
                                 >
                                   {t.remove}
@@ -600,10 +667,12 @@ export default function DiscardedModal({
                           const n = c as CartNonPM;
                           const src = allNon.find(
                             (g) =>
-                              g.productId === n.productId &&
-                              g.locationId === n.locationId &&
-                              g.currentStatus === n.currentStatus
+                              g.product.id === n.productId &&
+                              g.locationId === n.locationId
                           );
+                          const product = src?.product || n.product;
+                          const path = src?.locationPath || n.locationPath;
+
                           return (
                             <div
                               key={`non-${idx}`}
@@ -611,15 +680,21 @@ export default function DiscardedModal({
                             >
                               <div className="min-w-0">
                                 <div className="text-sm font-medium truncate">
-                                  {src?.product.name}
+                                  {product?.name || n.productId}
                                 </div>
-                                <div className="text-sm font-medium truncate">
-                                    <span className="text-red-600 dark:text-red-200">{src?.product.model}</span>・{src?.product.brand}
-                                </div>
+                                {product && (
+                                  <div className="text-sm font-medium truncate">
+                                    <span className="text-red-600 dark:text-red-200">
+                                      {product.model}
+                                    </span>
+                                    ・{product.brand}
+                                  </div>
+                                )}
                                 <div className="text-xs text-gray-600 dark:text-gray-400">
-                                  {prettyStatus(n.currentStatus)} · {src?.locationPath.join(" → ") || n.locationId}
+                                  {(path && path.join(" → ")) || n.locationId}
                                 </div>
                               </div>
+
                               <div className="flex items-center gap-2">
                                 <span className="text-sm">{t.quantity}</span>
                                 <button
@@ -649,7 +724,10 @@ export default function DiscardedModal({
                                   max={n.max}
                                   value={n.quantity}
                                   onChange={(e) => {
-                                    const raw = parseInt(e.target.value || "1", 10);
+                                    const raw = parseInt(
+                                      e.target.value || "1",
+                                      10
+                                    );
                                     const val = Math.max(
                                       1,
                                       Math.min(n.max, isNaN(raw) ? 1 : raw)
@@ -657,7 +735,10 @@ export default function DiscardedModal({
                                     setCart((prev) =>
                                       prev.map((x, i) =>
                                         i === idx
-                                          ? ({ ...(x as CartNonPM), quantity: val } as CartItem)
+                                          ? ({
+                                              ...(x as CartNonPM),
+                                              quantity: val,
+                                            } as CartItem)
                                           : x
                                       )
                                     );
@@ -687,10 +768,13 @@ export default function DiscardedModal({
                                   / {t.max} {n.max}
                                 </span>
                               </div>
+
                               <button
                                 className="px-2 py-1 text-xs rounded bg-red-600 text-white"
                                 onClick={() =>
-                                  setCart((prev) => prev.filter((_, i) => i !== idx))
+                                  setCart((prev) =>
+                                    prev.filter((_, i) => i !== idx)
+                                  )
                                 }
                               >
                                 {t.remove}
@@ -716,7 +800,9 @@ export default function DiscardedModal({
                   />
                 </div>
                 <div>
-                  <label className="block text-sm mb-1">{t.operatorLabel}</label>
+                  <label className="block text-sm mb-1">
+                    {t.operatorLabel}
+                  </label>
                   <input
                     className="w-full px-3 py-2 border rounded-lg bg-white dark:bg-gray-800 dark:border-gray-700"
                     value={operator}
@@ -736,7 +822,9 @@ export default function DiscardedModal({
                 <button
                   className="px-4 py-2 rounded bg-red-600 text-white disabled:opacity-60"
                   onClick={openConfirm}
-                  disabled={cart.length === 0 || !reason.trim() || !operator.trim()}
+                  disabled={
+                    cart.length === 0 || !reason.trim() || !operator.trim()
+                  }
                 >
                   {t.discard}
                 </button>
@@ -758,34 +846,41 @@ export default function DiscardedModal({
                   <div className="text-gray-500">{t.none}</div>
                 ) : (
                   <ul className="list-disc pl-5 space-y-1">
-                  {cart
-                    .filter((c) => c.type === "pm")
-                    .map((c, i) => {
-                      const id = (c as CartPM).stockId;
-                      const src = allPM.find(pm => pm.stockId === id);
-                      return (
-                        <li key={`cpm-${i}`}>
-                          <code>#{id}</code>
-                          {src && (
-                            <>                               
-                              {/* ✅ 新增：確認彈窗也顯示 IAMS（PM） */}
-                              {(() => {
-                                const iamssid = iamsByStock.get(id);
-                                return iamssid ? (
-                                  <>
-                                    {" · "}IAMS: <code>{iamssid} {"\n"}</code>
-                                  </>
-                                ) : null;
-                              })()}
-                              — {src.product.name}/{src.product.model}/{src.product.brand}
-                              {" · "}{src.locationPath.join(" → ")}
-                              {" · "}{t.status}{": "}{prettyStatus(src.currentStatus)}
+                    {cart
+                      .filter((c) => c.type === "pm")
+                      .map((c, i) => {
+                        const id = (c as CartPM).stockId;
+                        const src = allPM.find((pm) => pm.stockId === id);
+                        const snap = c as CartPM;
+                        const product = src?.product || snap.product;
+                        const path = src?.locationPath || snap.locationPath;
+                        const iams =
+                          src?.iamsId ||
+                          snap.iamsId ||
+                          iamsByStock.get(id) ||
+                          null;
 
-                            </>
-                          )}
-                        </li>
-                      );
-                    })}
+                        return (
+                          <li key={`cpm-${i}`}>
+                            <code>#{id}</code>
+                            {iams ? (
+                              <>
+                                {" · "}
+                                {t.iamsLabel}: <code>{iams}</code>
+                              </>
+                            ) : null}
+                            {product ? (
+                              <>
+                                {" — "}
+                                {product.name}/{product.model}/{product.brand}
+                              </>
+                            ) : null}
+                            {path && path.length > 0 ? (
+                              <> · {path.join(" → ")}</>
+                            ) : null}
+                          </li>
+                        );
+                      })}
                   </ul>
                 )}
               </div>
@@ -802,15 +897,20 @@ export default function DiscardedModal({
                         const n = c as CartNonPM;
                         const src = allNon.find(
                           (g) =>
-                            g.productId === n.productId &&
-                            g.locationId === n.locationId &&
-                            g.currentStatus === n.currentStatus
+                            g.product.id === n.productId &&
+                            g.locationId === n.locationId
                         );
+                        const product = src?.product || n.product;
+                        const path = src?.locationPath || n.locationPath;
+
                         return (
                           <li key={`cnon-${i}`}>
-                            {src?.product.name}/{src?.product.model}/{src?.product.brand} ·{" "}
-                            {src?.locationPath.join(" → ") || n.locationId} · {t.status}{": "}
-                            {prettyStatus(n.currentStatus)} · {t.qty}{": "}
+                            {product
+                              ? `${product.name}/${product.model}/${product.brand}`
+                              : `${n.productId}`}{" "}
+                            · {(path && path.join(" → ")) || n.locationId} ·{" "}
+                            {t.qty}
+                            {": "}
                             <b>{n.quantity}</b> ({t.max} {n.max})
                           </li>
                         );

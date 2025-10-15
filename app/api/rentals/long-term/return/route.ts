@@ -1,264 +1,141 @@
 // app/api/rentals/long-term/return/route.ts
-import { NextResponse } from "next/server";
-import {
-  getRentalLogs,
-  saveRentalLogs,
-  getStock,
-  saveStock,
-  getProductById,
-} from "@/lib/db";
+import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
 
-// Payload types
-type PMReturnInput = {
-  rentedItemId: string;
-  returnDate: string; // ISO
-};
+export const dynamic = "force-dynamic";
 
-type NonPMReturnInput = {
+// 前端會送這兩個陣列
+type PMInput = { stockId: string };
+type NonPMInput = {
   productId: string;
   locationId: string;
-  quantity: number;
-  renter: string;
   borrower: string;
-  loanType: "short_term" | "long_term";
-  returnDate: string; // ISO
+  renter: string;
+  quantity: number;
 };
 
-type MixedReturnInput = PMReturnInput | NonPMReturnInput;
-const isPM = (i: any): i is PMReturnInput => !!i?.rentedItemId;
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
 
-export async function POST(request: Request) {
-  const body = await request.json().catch(() => null);
-  if (!body) {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
-  }
+    // 兼容不同大小寫欄位名
+    const PropertyManaged: PMInput[] =
+      (Array.isArray(body?.PropertyManaged) && body.PropertyManaged) ||
+      (Array.isArray(body?.propertyManaged) && body.propertyManaged) ||
+      [];
 
-  // normalize to array
-  const items: MixedReturnInput[] = Array.isArray(body) ? body : [body];
-  if (items.length === 0) {
-    return NextResponse.json({ error: "Empty payload" }, { status: 400 });
-  }
+    const nonPropertyManaged: NonPMInput[] =
+      (Array.isArray(body?.nonPropertyManaged) && body.nonPropertyManaged) ||
+      (Array.isArray(body?.NonPropertyManaged) && body.NonPropertyManaged) ||
+      [];
 
-  // basic field validation
-  for (const [idx, it] of items.entries()) {
-    if (isPM(it)) {
-      if (!it.rentedItemId || !it.returnDate) {
-        return NextResponse.json(
-          { error: `Item #${idx + 1}: Missing rentedItemId or returnDate` },
-          { status: 400 }
-        );
-      }
-    } else {
-      const { productId, locationId, quantity, renter, borrower, loanType, returnDate } =
-        it as NonPMReturnInput;
-      if (
-        !productId ||
-        !locationId ||
-        typeof quantity !== "number" ||
-        quantity < 1 ||
-        !renter ||
-        !borrower ||
-        (loanType !== "short_term" && loanType !== "long_term") ||
-        !returnDate
-      ) {
-        return NextResponse.json(
-          {
-            error: `Item #${idx + 1}: Missing/invalid fields for non-property return`,
-          },
-          { status: 400 }
-        );
-      }
-    }
-  }
-
-  const logs = getRentalLogs();
-  const stockItems = getStock();
-
-  // quick lookups
-  const stockById = new Map(stockItems.map((s) => [s.id, s]));
-  const recordById = new Map(logs.map((r) => [r.id, r]));
-
-  // ---- Pre-validate & collect targets (no partial commit) ----
-
-  // 1) PM: ensure records exist & outstanding & product is PM & stock ok
-  const pmSeen = new Set<string>();
-  const pmTargets: Array<{ recId: string; returnDate: string }> = [];
-
-  for (const [idx, it] of items.entries()) {
-    if (!isPM(it)) continue;
-
-    const { rentedItemId, returnDate } = it;
-
-    if (pmSeen.has(rentedItemId)) {
+    if (!Array.isArray(PropertyManaged) || !Array.isArray(nonPropertyManaged)) {
       return NextResponse.json(
-        { error: `Item #${idx + 1}: Duplicate rentedItemId in payload (${rentedItemId})` },
-        { status: 400 }
-      );
-    }
-    pmSeen.add(rentedItemId);
-
-    const rec = recordById.get(rentedItemId);
-    if (!rec) {
-      return NextResponse.json(
-        { error: `Item #${idx + 1}: Rental record not found (${rentedItemId})` },
-        { status: 404 }
-      );
-    }
-    if (rec.returnDate) {
-      return NextResponse.json(
-        { error: `Item #${idx + 1}: Record already returned (${rentedItemId})` },
+        { message: "Invalid payload: PropertyManaged / nonPropertyManaged must be arrays" },
         { status: 400 }
       );
     }
 
-    const product = getProductById(rec.productId);
-    if (!product) {
-      return NextResponse.json(
-        { error: `Item #${idx + 1}: Product not found for record (${rec.productId})` },
-        { status: 404 }
-      );
-    }
-    if (!product.isPropertyManaged) {
-      return NextResponse.json(
-        { error: `Item #${idx + 1}: Not property-managed; use non-PM fields` },
-        { status: 400 }
-      );
-    }
+    const now = new Date();
+    const tx: any[] = [];
+    let pmClosed = 0;
+    let nonClosed = 0;
+    let nonRequested = 0;
 
-    const s = stockById.get(rec.stockId);
-    if (!s) {
-      return NextResponse.json(
-        { error: `Item #${idx + 1}: Stock not found (${rec.stockId})` },
-        { status: 404 }
-      );
-    }
-    if (s.discarded) {
-      return NextResponse.json(
-        { error: `Item #${idx + 1}: Stock has been discarded (${rec.stockId})` },
-        { status: 400 }
-      );
-    }
+    // === PM：用 stockId 精準關閉一筆「未歸還、長期借出」 ===
+    for (const item of PropertyManaged) {
+      if (!item?.stockId) continue;
 
-    pmTargets.push({ recId: rentedItemId, returnDate });
-  }
-
-  // 2) Non-PM: group by identity key and sum quantities; ensure enough outstanding
-  type NonPMKey = string; // productId::locationId::renter::borrower::loanType
-  const keyOf = (x: NonPMReturnInput): NonPMKey =>
-    `${x.productId}::${x.locationId}::${x.renter}::${x.borrower}::${x.loanType}`;
-
-  // Collect "tasks" in order (to preserve per-item returnDate)
-  const nonPMTasks: Array<{ key: NonPMKey; quantity: number; returnDate: string }> = [];
-  for (const it of items) {
-    if (!isPM(it)) {
-      nonPMTasks.push({ key: keyOf(it), quantity: it.quantity, returnDate: it.returnDate });
-    }
-  }
-
-  // Precompute candidates per key
-  const nonPMCandidates = new Map<
-    NonPMKey,
-    { records: typeof logs; index: number; productId: string; locationId: string }
-  >();
-
-  for (const [tIdx, task] of nonPMTasks.entries()) {
-    if (nonPMCandidates.has(task.key)) continue;
-
-    const [productId, locationId, renter, borrower, loanType] = task.key.split("::");
-    const product = getProductById(productId);
-    if (!product) {
-      return NextResponse.json(
-        { error: `Non-PM task #${tIdx + 1}: Product not found (${productId})` },
-        { status: 404 }
-      );
-    }
-    if (product.isPropertyManaged) {
-      return NextResponse.json(
-        { error: `Non-PM task #${tIdx + 1}: Product is property-managed; use rentedItemId` },
-        { status: 400 }
-      );
-    }
-
-    const candidates = logs.filter(
-      (r) =>
-        r.productId === productId &&
-        r.locationId === locationId &&
-        r.renter === renter &&
-        r.borrower === borrower &&
-        r.loanType === loanType &&
-        r.returnDate === null
-    );
-
-    // also ensure their stocks exist & not discarded (fail early)
-    for (const rec of candidates) {
-      const s = stockById.get(rec.stockId);
-      if (!s || s.discarded) {
-        return NextResponse.json(
-          {
-            error: `Non-PM task #${tIdx + 1}: Stock invalid for record ${rec.id} (stockId=${rec.stockId})`,
-          },
-          { status: 400 }
-        );
-      }
-    }
-
-    nonPMCandidates.set(task.key, {
-      records: candidates,
-      index: 0,
-      productId,
-      locationId,
-    });
-  }
-
-  // Validate availability per task (respecting multiple tasks on same key)
-  for (const [tIdx, task] of nonPMTasks.entries()) {
-    const group = nonPMCandidates.get(task.key)!;
-    const remain = group.records.length - group.index;
-    if (remain < task.quantity) {
-      return NextResponse.json(
-        {
-          error: `Non-PM task #${tIdx + 1}: Not enough outstanding rentals, requested ${task.quantity}, available ${remain}`,
+      // 找到該 stockId 尚未歸還的一筆（理論上 1 筆）
+      const open = await prisma.rental.findFirst({
+        where: {
+          loanType: "long_term",
+          returnDate: null,
+          stockId: item.stockId,
+          product: { isPropertyManaged: true },
         },
-        { status: 400 }
+        select: { id: true, stockId: true },
+        orderBy: [{ loanDate: "asc" }, { id: "asc" }],
+      });
+
+      if (!open) continue;
+
+      tx.push(
+        prisma.rental.update({
+          where: { id: open.id },
+          data: { returnDate: now },
+        }),
+        prisma.stock.update({
+          where: { id: open.stockId },
+          data: { currentStatus: "in_stock" }, // Prisma enum StockStatus
+        })
       );
+      pmClosed += 1;
     }
-    // tentatively "consume" slots (no mutation yet)
-    group.index += task.quantity;
-  }
 
-  // ---- Commit: apply returns & restore stock ----
+    // === Non-PM：依「群組鍵」找到 N 筆 open rentals，FIFO 關閉 ===
+    for (const g of nonPropertyManaged) {
+      if (!g?.productId || !g?.locationId) continue;
+      const qty = Math.max(0, Number(g.quantity) || 0);
+      if (qty === 0) continue;
 
-  // Reset indices for actual commit
-  for (const [k, v] of nonPMCandidates) {
-    nonPMCandidates.set(k, { ...v, index: 0 });
-  }
+      nonRequested += qty;
 
-  const updatedRecords: any[] = [];
+      const borrower = (g.borrower ?? "").trim();
+      const renter = (g.renter ?? "").trim();
 
-  // PM commit
-  for (const t of pmTargets) {
-    const rec = recordById.get(t.recId)!;
-    rec.returnDate = t.returnDate;
-    const s = stockById.get(rec.stockId)!;
-    s.currentStatus = "in_stock";
-    updatedRecords.push(rec);
-  }
+      // 只用群組鍵 + open 條件，不使用 loanDate/dueDate 比對
+      const opens = await prisma.rental.findMany({
+        where: {
+          loanType: "long_term",
+          returnDate: null,
+          productId: g.productId,
+          locationId: g.locationId,
+          borrower,
+          renter,
+          product: { isPropertyManaged: false },
+        },
+        select: { id: true, stockId: true, loanDate: true },
+        orderBy: [{ loanDate: "asc" }, { id: "asc" }],
+        take: qty,
+      });
 
-  // Non-PM commit (preserve per-task returnDate)
-  for (const task of nonPMTasks) {
-    const group = nonPMCandidates.get(task.key)!;
-    for (let i = 0; i < task.quantity; i++) {
-      const rec = group.records[group.index++];
-      rec.returnDate = task.returnDate;
-      const s = stockById.get(rec.stockId)!;
-      s.currentStatus = "in_stock";
-      updatedRecords.push(rec);
+      if (opens.length === 0) continue;
+
+      for (const r of opens) {
+        tx.push(
+          prisma.rental.update({
+            where: { id: r.id },
+            data: { returnDate: now },
+          }),
+          prisma.stock.update({
+            where: { id: r.stockId },
+            data: { currentStatus: "in_stock" },
+          })
+        );
+      }
+      nonClosed += opens.length;
     }
+
+    // 事務提交
+    if (tx.length > 0) {
+      await prisma.$transaction(tx);
+    }
+
+    const partial = nonClosed !== nonRequested;
+    return NextResponse.json({
+      ok: true,
+      result: {
+        pmClosed,
+        nonClosed,
+        nonRequested,
+        partial, // true 表示 Non-PM 有請求 N 但只找到 M 筆（併發下可發生）
+      },
+    });
+  } catch (err: any) {
+    return NextResponse.json(
+      { message: err?.message ?? "Failed to return rentals" },
+      { status: 500 }
+    );
   }
-
-  // persist
-  saveStock(stockItems);
-  saveRentalLogs(logs);
-
-  return NextResponse.json(updatedRecords, { status: 200 });
 }

@@ -93,8 +93,3 @@ input[type="number"]::-webkit-outer-spin-button {
   -webkit-appearance: inner-spin-button !important; /* 對於 Webkit/Blink 瀏覽器 */
   opacity: 1 !important; /* 確保不被隱藏 */
 }
-
-input[type="number"] {
-  -moz-appearance: textfield; /* 對於 Firefox */
-}
-
