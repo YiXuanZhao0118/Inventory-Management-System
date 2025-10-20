@@ -64,10 +64,18 @@ styles/, src/            # 共用樣式與元件
 - **PostgreSQL** 13 以上，並可透過 `DATABASE_URL` 連線
 - **Python** 3.10 以上，且安裝 `requests` 與 `beautifulsoup4` 供分析腳本使用
 
+> Recommended runtime: the repository includes an `.nvmrc` pinned to Node.js 20.19.0 so `nvm use` / `fnm use` automatically selects a compatible version.
+
+> 建議使用版本：專案內含 `.nvmrc` 並固定在 Node.js 20.19.0，可透過 `nvm use`／`fnm use` 自動切換到相容環境。
+
 ## Environment Variables / 環境變數
 Create a `.env` / `.env.local` file in the project root. The most important variables are:
 
+A starter `.env.example` is provided—copy it to `.env.local` (or `.env`) and adjust secrets as needed.
+
 請在專案根目錄建立 `.env` 或 `.env.local` 檔案，以下為主要環境變數：
+
+專案提供 `.env.example` 範本，可複製為 `.env.local`（或 `.env`）後再依需求調整密鑰。
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
@@ -99,6 +107,10 @@ Create a `.env` / `.env.local` file in the project root. The most important vari
 
 > 小提醒：若前端需要使用環境變數，請同步設定對應的 `NEXT_PUBLIC_*` 前綴。
 
+`DATABASE_URL` defaults in the example file line up with the Docker helper below, so you can run a local database without extra setup.
+
+範本檔案中的 `DATABASE_URL` 會對應下方的 Docker 輔助工具，讓你免額外設定即可啟動本地資料庫。
+
 A minimal development snippet looks like:
 
 以下為開發環境範例設定：
@@ -116,6 +128,10 @@ SMTP_FROM="inventory@example.com"
 ```
 
 ## Getting Started / 快速開始
+> If you use `nvm`, run `nvm use` (or `nvm install`) beforehand to honour the pinned Node.js version.
+
+> 若使用 `nvm`，建議先執行 `nvm use`（或首次執行 `nvm install`）以套用固定的 Node.js 版本。
+
 1. **Install dependencies / 安裝套件**
    ```bash
    npm install
@@ -143,6 +159,20 @@ SMTP_FROM="inventory@example.com"
    npm run build
    npm run start  # serves on port 3000 with Next.js / Next.js 於 3000 埠提供服務
    ```
+
+### Optional: Dockerized PostgreSQL helper / Docker 化 PostgreSQL 輔助工具（選用）
+
+To launch a ready-to-use Postgres 15 instance with credentials that match `.env.example`, run:
+
+如需快速啟動與 `.env.example` 相容的 Postgres 15 容器，可執行：
+
+```bash
+docker compose up -d db
+```
+
+Stop it afterwards with `docker compose down`.
+
+結束開發時可使用 `docker compose down` 停止容器。
 
 ## Quality & Tooling / 品質與工具
 - `npm run lint` – Next.js ESLint suite / Next.js ESLint 規則檢查

@@ -1,5 +1,6 @@
 // app/api/devices/route.ts
 import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 
 export const dynamic = "force-dynamic";
@@ -15,8 +16,12 @@ export async function GET(req: NextRequest) {
   if (!id || !isUUID(id)) {
     return NextResponse.json({ ok: false, message: "Invalid id" }, { status: 400 });
   }
-  const exists = !!(await prisma.device.findUnique({ where: { id } }));
-  return NextResponse.json({ ok: true, exists });
+  try {
+    const exists = !!(await prisma.device.findUnique({ where: { id } }));
+    return NextResponse.json({ ok: true, exists });
+  } catch (error) {
+    return handlePrismaError("lookup", error);
+  }
 }
 
 /** 註冊：POST /api/devices  body: { id, name } */
@@ -39,12 +44,36 @@ export async function POST(req: NextRequest) {
   }
 
   // 用 upsert 讓這個 API 具備「重送不壞」的特性：已存在就更新名稱
-  const saved = await prisma.device.upsert({
-    where: { id },
-    update: { name },
-    create: { id, name },
-    select: { id: true, name: true, createdAt: true },
-  });
+  try {
+    const saved = await prisma.device.upsert({
+      where: { id },
+      update: { name },
+      create: { id, name },
+      select: { id: true, name: true, createdAt: true },
+    });
 
-  return NextResponse.json({ ok: true, device: saved });
+    return NextResponse.json({ ok: true, device: saved });
+  } catch (error) {
+    return handlePrismaError("upsert", error);
+  }
+}
+
+function handlePrismaError(action: "lookup" | "upsert", error: unknown) {
+  if (
+    error instanceof Prisma.PrismaClientInitializationError ||
+    (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P1001")
+  ) {
+    console.error(`Device ${action} failed: database unreachable.`, error);
+    return NextResponse.json(
+      {
+        ok: false,
+        message:
+          "Database is unavailable. Start the PostgreSQL instance (e.g. `docker compose up -d db`) and try again.",
+      },
+      { status: 503 },
+    );
+  }
+
+  console.error(`Device ${action} failed with an unexpected error.`, error);
+  return NextResponse.json({ ok: false, message: "Internal server error" }, { status: 500 });
 }
