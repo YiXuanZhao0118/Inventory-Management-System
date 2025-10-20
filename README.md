@@ -64,7 +64,6 @@ styles/, src/            # 共用樣式與元件
 - **PostgreSQL** 13 以上，並可透過 `DATABASE_URL` 連線
 - **Python** 3.10 以上，且安裝 `requests` 與 `beautifulsoup4` 供分析腳本使用
 
-
 > Recommended runtime: the repository includes an `.nvmrc` pinned to Node.js 20.19.0 so `nvm use` / `fnm use` automatically selects a compatible version.
 
 > 建議使用版本：專案內含 `.nvmrc` 並固定在 Node.js 20.19.0，可透過 `nvm use`／`fnm use` 自動切換到相容環境。
