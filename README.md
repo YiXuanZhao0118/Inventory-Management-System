@@ -54,28 +54,32 @@ styles/, src/            # 共用樣式與元件
 ```
 
 ## Prerequisites / 前置需求
-- **Node.js** ≥ 20.19.0 (satisfies Next.js 15, Prisma 6, yargs 18, etc.)
+- **Node.js** ≥ 18.18 or ≥ 20.x (Next.js 15 requirement)
 - **npm** (or another compatible package manager)
 - **PostgreSQL** 13+ reachable via `DATABASE_URL`
 - **Python** 3.10+ with `requests` and `beautifulsoup4` for the analyzer script
 
-- **Node.js** 版本需 ≥ 20.19.0（符合 Next.js 15、Prisma 6、yargs 18 等套件需求）
+- **Node.js** 版本需 ≥ 18.18 或 ≥ 20.x（Next.js 15 要求）
 - **npm** 或其他相容的套件管理工具
 - **PostgreSQL** 13 以上，並可透過 `DATABASE_URL` 連線
 - **Python** 3.10 以上，且安裝 `requests` 與 `beautifulsoup4` 供分析腳本使用
 
-> The repository ships with an `.nvmrc` pinned to Node 20.19.0 so `nvm use` / `fnm use` automatically selects the supported runtime.
+> Recommended runtime: the repository includes an `.nvmrc` pinned to Node.js 20.19.0 so `nvm use` / `fnm use` automatically selects a compatible version.
 
-> 專案附帶 `.nvmrc` 並固定在 Node 20.19.0，可透過 `nvm use` / `fnm use` 自動切換到相容版本。
+> 建議使用版本：專案內含 `.nvmrc` 並固定在 Node.js 20.19.0，可透過 `nvm use`／`fnm use` 自動切換到相容環境。
 
 ## Environment Variables / 環境變數
-Create a `.env` / `.env.local` file in the project root (you can copy `.env.example` to get started). The most important variables are:
+Create a `.env` / `.env.local` file in the project root. The most important variables are:
+
+A starter `.env.example` is provided—copy it to `.env.local` (or `.env`) and adjust secrets as needed.
 
 請在專案根目錄建立 `.env` 或 `.env.local` 檔案，以下為主要環境變數：
 
+專案提供 `.env.example` 範本，可複製為 `.env.local`（或 `.env`）後再依需求調整密鑰。
+
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | ✅ | PostgreSQL connection string used by Prisma (defaults match `docker-compose.yml`). |
+| `DATABASE_URL` | ✅ | PostgreSQL connection string used by Prisma. |
 | `AUTH_SECRET` | ✅ | 32+ character secret for signing user session JWTs & verification tickets. |
 | `ROOT_LOCATION_ID` | ✅ | UUID of the root storage location; validated on boot. |
 | `NEXT_PUBLIC_ROOT_LOCATION_ID` | Optional | Exposes the same root UUID to the client for locking the location tree. |
@@ -88,7 +92,7 @@ Create a `.env` / `.env.local` file in the project root (you can copy `.env.exam
 
 | 變數 | 是否必填 | 用途 |
 | --- | --- | --- |
-| `DATABASE_URL` | ✅ | Prisma 連線用 PostgreSQL 字串（預設值對應 `docker-compose.yml`）。 |
+| `DATABASE_URL` | ✅ | Prisma 連線用 PostgreSQL 字串。 |
 | `AUTH_SECRET` | ✅ | 32 字元以上的密鑰，用於簽署使用者 Session JWT 與驗證票證。 |
 | `ROOT_LOCATION_ID` | ✅ | 根儲位的 UUID，啟動時會驗證格式。 |
 | `NEXT_PUBLIC_ROOT_LOCATION_ID` | 選填 | 將根儲位 UUID 暴露給前端，用於鎖定儲位樹。 |
@@ -102,6 +106,10 @@ Create a `.env` / `.env.local` file in the project root (you can copy `.env.exam
 > Tip: also export `NEXT_PUBLIC_*` variants for any env values required in the browser.
 
 > 小提醒：若前端需要使用環境變數，請同步設定對應的 `NEXT_PUBLIC_*` 前綴。
+
+`DATABASE_URL` defaults in the example file line up with the Docker helper below, so you can run a local database without extra setup.
+
+範本檔案中的 `DATABASE_URL` 會對應下方的 Docker 輔助工具，讓你免額外設定即可啟動本地資料庫。
 
 A minimal development snippet looks like:
 
@@ -120,26 +128,19 @@ SMTP_FROM="inventory@example.com"
 ```
 
 ## Getting Started / 快速開始
-1. **Select the Node.js runtime / 切換 Node.js 版本**
-   ```bash
-   nvm use  # or `nvm install` on first run / 首次可改用 `nvm install`
-   ```
-2. **Install dependencies / 安裝套件**
+> If you use `nvm`, run `nvm use` (or `nvm install`) beforehand to honour the pinned Node.js version.
+
+> 若使用 `nvm`，建議先執行 `nvm use`（或首次執行 `nvm install`）以套用固定的 Node.js 版本。
+
+1. **Install dependencies / 安裝套件**
    ```bash
    npm install
    ```
-3. **Provision PostgreSQL (optional Docker helper) / 啟動 PostgreSQL（可選擇使用 Docker）**
-   ```bash
-   docker compose up -d db
-   ```
-   This launches a Postgres 15 container with credentials matching the sample `DATABASE_URL`.
-
-   這會啟動 Postgres 15 容器，帳密與範例 `DATABASE_URL` 相同。
-4. **Generate Prisma client / 產生 Prisma Client** (rerun when the schema changes / Schema 變更時需重新執行)
+2. **Generate Prisma client / 產生 Prisma Client** (rerun when the schema changes / Schema 變更時需重新執行)
    ```bash
    npx prisma generate --schema prisma/schema.prisma
    ```
-5. **Apply migrations / 套用資料庫遷移**
+3. **Apply migrations / 套用資料庫遷移**
    ```bash
    # During development: creates or updates the local database / 開發環境：建立或更新本機資料庫
    npx prisma migrate dev --schema prisma/schema.prisma
@@ -147,17 +148,31 @@ SMTP_FROM="inventory@example.com"
    # In staging/production pipelines / 佈署環境：套用既有遷移
    npx prisma migrate deploy --schema prisma/schema.prisma
    ```
-6. **Run the development server / 執行開發伺服器**
+4. **Run the development server / 執行開發伺服器**
    ```bash
    npm run dev
    ```
    The app listens on http://localhost:3001 by default.
    預設服務位址為 http://localhost:3001。
-7. **Build for production / 建置正式版**
+5. **Build for production / 建置正式版**
    ```bash
    npm run build
    npm run start  # serves on port 3000 with Next.js / Next.js 於 3000 埠提供服務
    ```
+
+### Optional: Dockerized PostgreSQL helper / Docker 化 PostgreSQL 輔助工具（選用）
+
+To launch a ready-to-use Postgres 15 instance with credentials that match `.env.example`, run:
+
+如需快速啟動與 `.env.example` 相容的 Postgres 15 容器，可執行：
+
+```bash
+docker compose up -d db
+```
+
+Stop it afterwards with `docker compose down`.
+
+結束開發時可使用 `docker compose down` 停止容器。
 
 ## Quality & Tooling / 品質與工具
 - `npm run lint` – Next.js ESLint suite / Next.js ESLint 規則檢查
