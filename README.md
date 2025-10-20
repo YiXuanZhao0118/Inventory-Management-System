@@ -54,12 +54,12 @@ styles/, src/            # 共用樣式與元件
 ```
 
 ## Prerequisites / 前置需求
-- **Node.js** ≥ 18.18 or ≥ 20.x (Next.js 15 requirement)
+- **Node.js** ≥ 20.19.0 (satisfies Next.js 15, Prisma 6, yargs 18, etc.)
 - **npm** (or another compatible package manager)
 - **PostgreSQL** 13+ reachable via `DATABASE_URL`
 - **Python** 3.10+ with `requests` and `beautifulsoup4` for the analyzer script
 
-- **Node.js** 版本需 ≥ 18.18 或 ≥ 20.x（Next.js 15 要求）
+- **Node.js** 版本需 ≥ 20.19.0（符合 Next.js 15、Prisma 6、yargs 18 等套件需求）
 - **npm** 或其他相容的套件管理工具
 - **PostgreSQL** 13 以上，並可透過 `DATABASE_URL` 連線
 - **Python** 3.10 以上，且安裝 `requests` 與 `beautifulsoup4` 供分析腳本使用
@@ -136,11 +136,11 @@ SMTP_FROM="inventory@example.com"
    ```bash
    npm install
    ```
-2. **Generate Prisma client / 產生 Prisma Client** (rerun when the schema changes / Schema 變更時需重新執行)
+3. **Generate Prisma client / 產生 Prisma Client** (rerun when the schema changes / Schema 變更時需重新執行)
    ```bash
    npx prisma generate --schema prisma/schema.prisma
    ```
-3. **Apply migrations / 套用資料庫遷移**
+4. **Apply migrations / 套用資料庫遷移**
    ```bash
    # During development: creates or updates the local database / 開發環境：建立或更新本機資料庫
    npx prisma migrate dev --schema prisma/schema.prisma
@@ -148,13 +148,13 @@ SMTP_FROM="inventory@example.com"
    # In staging/production pipelines / 佈署環境：套用既有遷移
    npx prisma migrate deploy --schema prisma/schema.prisma
    ```
-4. **Run the development server / 執行開發伺服器**
+5. **Run the development server / 執行開發伺服器**
    ```bash
    npm run dev
    ```
    The app listens on http://localhost:3001 by default.
    預設服務位址為 http://localhost:3001。
-5. **Build for production / 建置正式版**
+6. **Build for production / 建置正式版**
    ```bash
    npm run build
    npm run start  # serves on port 3000 with Next.js / Next.js 於 3000 埠提供服務
