@@ -22,6 +22,131 @@ A full-stack inventory, rental, and knowledge management platform for optical co
 - **Python-assisted product intel / Python 輔助產品情報** – Call the bundled `ProductInformation/analyze_cli.py` scraper through an API route to enrich product records by fetching metadata from supplier pages. (`app/api/products/analyze_product_info/route.ts`)
   - 以 API 呼叫內建的 Python 爬蟲 `ProductInformation/analyze_cli.py`，自動抓取供應商資料增補產品資訊。
 
+## Page Reference & API Map / 頁面與 API 對照
+
+### Public Routes / 公開頁面
+
+#### `/account` – Account portal / 帳號入口
+- **Purpose / 用途**: User login and session bootstrap before redirecting into the protected workspace. / 供使用者登入並在進入受保護工作區前建立 Session。
+- **API calls / 使用 API**:
+  - `GET /api/auth/me` – Reads the current session cookie and returns the authenticated profile. / 讀取現有 Session Cookie 並回傳已驗證的使用者資料。
+  - `POST /api/auth/login` – Submits credentials, issues the `session` JWT cookie, and broadcasts an auth-change event to the shell. / 提交帳密、簽發 `session` JWT Cookie，並通知外層殼層登入狀態變更。
+
+#### `/device-registration` – Device ID registration / 裝置註冊
+- **Purpose / 用途**: Self-serve kiosk registration that assigns a UUID and friendly name before allowing short-term loans. / 讓自助裝置取得 UUID 與顯示名稱，才能進行短期租借。
+- **API calls / 使用 API**:
+  - `GET /api/devices?id={deviceId}` – Checks whether the generated device ID already exists; auto-redirects when registered. / 檢查產生的 deviceId 是否已存在，若已註冊則自動導向下一步。
+  - `POST /api/devices` – Persists the device ID/name pair. / 儲存裝置識別碼與名稱。
+
+### Protected Routes / 受保護頁面
+
+#### `/` – Feature launchpad / 功能總覽
+- **Purpose / 用途**: Static navigation grid for privileged users. / 顯示主要功能的導覽看板。
+- **API calls / 使用 API**: None – this page only links to other routes. / 無直接 API 呼叫，僅提供超連結。
+
+#### `/inventory` – Inventory dashboard & actions / 庫存儀表板與操作
+- **Purpose / 用途**: Searchable inventory tables with aggregated/individual views, transfer and discard workflows, and IAMS tagging. / 可搜尋的庫存表格（彙總／個別模式）、轉移與報廢流程，以及 IAMS 標籤管理。
+- **API calls / 使用 API**:
+  - `GET /api/inventory/pm?status=…&q=…` – Lists property-managed stock records for the current filter. / 依條件列出財產管理品項。
+  - `GET /api/inventory/nonpm?status=…&q=…` – Lists non-property-managed stock groups with quantity aggregates. / 依條件列出非財產品項與數量。
+  - `PATCH /api/inventory/pm/iams` – Saves edited IAMS tag IDs per stock record. / 儲存個別庫存項目的 IAMS 標籤。
+  - **Discard modal / 報廢彈窗**
+    - `POST /api/inventory/discard` – Confirms scrap actions for PM / non-PM selections. / 對財產與非財產項目提交報廢。
+  - **Transfer modal / 轉移彈窗**
+    - `GET /api/locations/tree` – Loads the latest selectable location tree. / 取得可用的儲位樹。
+    - `POST /api/inventory/transfer` – Moves selected items into a new location. / 將指定庫存轉移至新儲位。
+
+#### `/inventory/add` – Stock intake / 新增庫存
+- **Purpose / 用途**: Adds property-managed singles or quantity-based non-property stock via drag-and-drop drafts. / 透過拖放草稿新增財產單件或非財產數量。
+- **API calls / 使用 API**:
+  - `GET /api/products?isPM=true|false&q=…&page=…` – Paginates candidate products for PM and non-PM columns. / 分別分頁取得財產與非財產可用商品清單。
+  - `POST /api/inventory/add` – Persists drafted stock additions for both categories. / 提交草稿並寫入兩類庫存。
+
+#### `/long-term` – Long-term rentals / 長期租借作業
+- **Purpose / 用途**: Handles borrowing and returning workflows with due dates, borrower/operator attribution, and outstanding loan visibility. / 管理長期借出與歸還流程，含到期日、借出人／經手人資訊與未結清清單。
+- **API calls / 使用 API**:
+  - `GET /api/inventory/pm?status=in_stock&q=…` – Sources available property-managed stock for loans. / 取得可借出的財產項目。
+  - `GET /api/inventory/nonpm?status=in_stock&q=…` – Sources available non-property stock and remaining caps. / 取得可借出的非財產項目與剩餘可借數。
+  - `POST /api/rentals/long-term/loan` – Creates loan records for all drafted items. / 依草稿批次建立長期借出紀錄。
+  - `GET /api/rentals/long-term/open/pm?…` – Lists active property-managed loans for return processing. / 取得仍在外的財產借出清單供歸還作業。
+  - `GET /api/rentals/long-term/open/nonpm?…` – Lists active non-property loans grouped by product/location. / 取得仍在外的非財產借出分組資料。
+  - `POST /api/rentals/long-term/return` – Records returns (with quantities for non-PM). / 提交歸還動作，並處理非財產數量。
+
+#### `/short-term` – Short-term kiosk / 短期自助借還
+- **Purpose / 用途**: Device-aware kiosk for scanning QR codes, borrowing, extending, and returning items in hours-long sessions. / 供裝置識別的自助機掃碼借出、展延與歸還短期租借。
+- **API calls / 使用 API**:
+  - `GET /api/rentals/short-term/active?includeDeviceNames=1` – Streams active loans plus device-name mappings for “My Loans” and “All Active”. / 取得目前租借中清單及裝置名稱對照，用於「我的租借」與「全部活動中」。
+  - `GET /api/devices/verify?deviceId=…` – Confirms the kiosk/device registration before allowing borrowing. / 借出前確認裝置是否已註冊。
+  - `POST /api/rentals/short-term/borrow` – Creates a new short-term rental tied to the device ID. / 依裝置識別建立短期租借。
+  - `POST /api/rentals/short-term/extend` – Extends the due time by three hours (guarded by policies). / 依規則展延三小時。
+  - `POST /api/rentals/short-term/return` – Marks a rental as returned. / 完成短期租借歸還。
+
+#### `/short-term/qrcodes` – QR batch generator / 短期 QR Code 產生器
+- **Purpose / 用途**: Produces printable QR labels for property-managed stock with sizing and base-origin options. / 為財產項目產生可列印 QR 標籤，並可設定尺寸與網址來源。
+- **API calls / 使用 API**:
+  - `GET /api/qrcode/short-term/pm?…` – Returns SVG/PNG payloads for the requested stock IDs. / 依參數回傳對應庫存的 SVG/PNG 內容。
+
+#### `/qrcode/print` – Print layout for QR batches / QR Code 列印版面
+- **Purpose / 用途**: Dedicated print-ready grid fed by selections from the QR generator. / 供列印 QR 批次的專用版面。
+- **API calls / 使用 API**:
+  - `GET /api/qrcode/short-term/pm?…` – Prefetches all QR assets to embed on the page before printing. / 預先載入所有選定 QR 資源以便列印。
+
+#### `/products` – Product catalogue / 產品清單管理
+- **Purpose / 用途**: Full CRUD surface with usage guards, analyzer integration, and optional image uploads. / 提供具使用限制檢查的產品 CRUD、整合資料分析器並支援圖片上傳。
+- **API calls / 使用 API**:
+  - `GET /api/products/sort?isPM=…&q=…&page=…&limit=…&sortBy=…&sortDir=…` – Retrieves the paginated, sorted catalogue. / 依條件取得分頁與排序後的商品清單。
+  - `GET /api/products/usage?ids=…` – Returns stock usage, deletion locks, and short-term status flags. / 回傳每個商品的庫存使用量、刪除限制與短期租借鎖定資訊。
+  - `POST /api/products/sort` – Creates a new product entry. / 新增商品。
+  - `POST /api/products/sort/{id}/image` – Uploads an optional hero image for the created/edited product. / 上傳對應商品的主圖片。
+  - `POST /api/products/analyze_product_info` – Invokes the Python scraper to prefill fields from a supplier URL. / 呼叫 Python 爬蟲自供應商網址帶入欄位。
+  - `PATCH /api/products/sort/{id}` – Updates product metadata (respecting usage locks). / 更新商品資料並遵守使用鎖定規則。
+  - `DELETE /api/products/sort/{id}` – Removes a product when no blocking usage exists. / 在無使用限制時刪除商品。
+
+#### `/products-overview` – Datasheet overview / 產品資料庫概覽
+- **Purpose / 用途**: Visualises datasheet coverage per product and manages file bundles (images, PDFs, videos). / 彙總每個產品的資料檔覆蓋率並管理附件（圖片、PDF、影片）。
+- **API calls / 使用 API**:
+  - `GET /api/products-overview?isPM=…&q=…&page=…` – Lists products with coverage statistics. / 依條件列出產品與附件覆蓋統計。
+  - `GET /api/product-files?productId={id}` – Fetches the grouped attachment metadata for a product. / 取得指定產品的附件明細。
+  - `POST /api/product-files` – Creates a new product-file bundle or uploads additional assets. / 新增產品附件資料夾或上傳新檔案。
+  - `PATCH /api/product-files` – Renames folders/files, reorders entries, and uploads replacements. / 重新命名資料夾／檔案、調整排序並可補上新檔案。
+  - `DELETE /api/product-files?id={id}` – Deletes an entire product-file record and its stored assets. / 刪除整筆產品附件與對應實體檔案。
+
+#### `/locations` – Location tree manager / 儲位樹管理
+- **Purpose / 用途**: Drag-and-drop editor for the hierarchical storage map with root locking and usage badges. / 提供多層儲位拖曳編輯，支援根節點鎖定與使用量徽章。
+- **API calls / 使用 API**:
+  - `GET /api/locations` – Loads the canonical storage tree. / 載入標準儲位樹。
+  - `POST /api/locations` – Saves edited tree structures after validation. / 驗證通過後儲存更新的儲位結構。
+  - `GET /api/locations/usage` – Returns per-node stock counts to block unsafe deletions. / 取得每個節點的庫存數以阻擋不安全的刪除。
+
+#### `/FAQs` – Knowledge base / 知識庫管理
+- **Purpose / 用途**: Curates Markdown Q&A articles with media attachments, ordering, and search. / 管理附帶媒體的 Markdown Q&A 文章，支援排序與搜尋。
+- **API calls / 使用 API**:
+  - `GET /api/qa` – Loads all QA entries and their ordering metadata. / 取得全部 QA 條目與排序資訊。
+  - `POST /api/qa` – Creates a new QA article. / 建立新的 QA 文章。
+  - `PATCH /api/qa/{id}` – Updates an existing QA article. / 更新既有 QA 文章。
+  - `DELETE /api/qa/{id}` – Removes an article and its references. / 刪除 QA 條目及相關連結。
+  - `POST /api/qa/upload` – Uploads supporting images or videos used inside Markdown content. / 上傳 Markdown 內容使用的圖片或影片。
+  - `POST /api/qa/reorder` – Persists drag-and-drop ordering changes. / 儲存拖曳後的排序調整。
+
+#### `/admin` – Administrative console / 管理控制台
+- **Purpose / 用途**: Hosts data import/export tooling, short-term rental oversight, and manual account management. / 提供資料匯入匯出、短期租借監控與手動帳號管理。
+- **API calls / 使用 API**:
+  - **Data I/O / 資料匯入匯出**
+    - `POST /api/sys/maintenance` – Toggles maintenance banners during destructive imports. / 匯入期間切換維護模式橫幅。
+    - `GET /api/data/export?format=zip&files=referenced&qa=referenced` – Streams the full asset-inclusive export bundle. / 匯出含附件的完整資料包。
+    - `GET /api/data/export?format=json` – Retrieves a JSON snapshot for diffing. / 取得 JSON 快照以利差異比較。
+    - `POST /api/data/import` – Uploads the reviewed bundle and applies changes. / 上傳審核後的壓縮包並套用變更。
+  - **Short-term admin / 短期租借總覽**
+    - `GET /api/rentals/short-term/active?includeDeviceNames=1` – Mirrors kiosk data with device display names for auditing. / 與自助機同步取得租借清單及裝置名稱供稽核。
+    - `POST /api/rentals/short-term/return` – Lets admins close any active rental (with audit headers). / 讓管理者結束任一租借，並附帶稽核標頭。
+  - **User accounts / 使用者帳號**
+    - `POST /api/users/register/init` – Sends verification codes for new accounts. / 寄送註冊驗證碼。
+    - `POST /api/users/register/verify-only` – Confirms the code without setting a password yet. / 驗證註冊碼但尚未設定密碼。
+    - `POST /api/users/register/complete` – Finalises registration with credentials. / 完成註冊並設定密碼。
+    - `POST /api/users/reset/init` – Initiates password reset emails. / 寄送密碼重設驗證碼。
+    - `POST /api/users/reset/verify-only` – Validates the reset code. / 驗證重設碼。
+    - `POST /api/users/reset/complete` – Sets a new password using the issued ticket. / 使用票證設定新密碼。
+
 ## Tech Stack / 技術棧
 - **Framework / 框架**: Next.js 15 (App Router), React 19
 - **Database / 資料庫**: PostgreSQL with Prisma ORM
